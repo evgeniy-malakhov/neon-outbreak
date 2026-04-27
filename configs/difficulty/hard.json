@@ -1,0 +1,22 @@
+{
+  "key": "hard",
+  "initial_zombies": 11,
+  "max_zombies": 42,
+  "zombie_health_multiplier": 1.25,
+  "zombie_armor_multiplier": 1.2,
+  "zombie_speed_multiplier": 1.12,
+  "zombie_damage_multiplier": 1.25,
+  "weapon_wear_multiplier": 1.35,
+  "armor_wear_multiplier": 1.35,
+  "weapon_damage_multiplier": 0.9,
+  "weapon_damage_multipliers": {
+    "pistol": 0.9,
+    "smg": 0.92,
+    "shotgun": 0.88,
+    "rifle": 0.9
+  },
+  "loot_spawn_multiplier": 0.85,
+  "zombie_spawn_interval_multiplier": 0.85,
+  "loot_spawn_interval_multiplier": 1.15,
+  "world_loot_cap": 76
+}

@@ -1,0 +1,22 @@
+{
+  "key": "insane",
+  "initial_zombies": 16,
+  "max_zombies": 62,
+  "zombie_health_multiplier": 1.9,
+  "zombie_armor_multiplier": 1.8,
+  "zombie_speed_multiplier": 1.45,
+  "zombie_damage_multiplier": 1.75,
+  "weapon_wear_multiplier": 2.05,
+  "armor_wear_multiplier": 2.15,
+  "weapon_damage_multiplier": 0.72,
+  "weapon_damage_multipliers": {
+    "pistol": 0.72,
+    "smg": 0.76,
+    "shotgun": 0.7,
+    "rifle": 0.74
+  },
+  "loot_spawn_multiplier": 0.52,
+  "zombie_spawn_interval_multiplier": 0.5,
+  "loot_spawn_interval_multiplier": 1.65,
+  "world_loot_cap": 54
+}

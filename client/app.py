@@ -1,0 +1,1365 @@
+from __future__ import annotations
+
+import json
+import math
+import threading
+import time
+from dataclasses import dataclass
+from pathlib import Path
+
+import pygame
+
+from client.network import OnlineClient, ping_server
+from shared.constants import ARMORS, MAP_HEIGHT, MAP_WIDTH, SLOTS, WEAPONS, ZOMBIES
+from shared.difficulty import DIFFICULTY_KEYS, load_difficulty
+from shared.items import EQUIPMENT_SLOTS, ITEMS, RECIPES
+from shared.models import BuildingState, InputCommand, LootState, PlayerState, RectState, Vec2, WorldSnapshot
+from shared.simulation import GameWorld
+
+
+SCREEN_W = 1280
+SCREEN_H = 760
+FPS = 60
+ROOT = Path(__file__).resolve().parents[1]
+
+BG = (9, 12, 22)
+PANEL = (19, 25, 42)
+PANEL_2 = (28, 37, 62)
+TEXT = (232, 239, 255)
+MUTED = (139, 156, 188)
+CYAN = (76, 225, 255)
+GREEN = (120, 240, 164)
+RED = (255, 91, 111)
+YELLOW = (255, 210, 112)
+PURPLE = (177, 132, 255)
+
+
+@dataclass(slots=True)
+class Button:
+    rect: pygame.Rect
+    label: str
+    action: str
+
+    def hovered(self, mouse: tuple[int, int]) -> bool:
+        return self.rect.collidepoint(mouse)
+
+
+@dataclass(slots=True)
+class ServerEntry:
+    name: str
+    host: str
+    port: int
+    ping_ms: float | None = None
+    players: int = 0
+    status: str = "checking"
+    difficulty: str = "medium"
+
+
+class GameApp:
+    def __init__(self) -> None:
+        pygame.init()
+        pygame.display.set_caption("Neon Outbreak")
+        self.screen = pygame.display.set_mode((SCREEN_W, SCREEN_H))
+        self.clock = pygame.time.Clock()
+        self.font = pygame.font.SysFont("segoeui", 18)
+        self.small = pygame.font.SysFont("segoeui", 14)
+        self.big = pygame.font.SysFont("segoeui", 56, bold=True)
+        self.mid = pygame.font.SysFont("segoeui", 26, bold=True)
+        self.language = "en"
+        self.locales = self._load_locales()
+        self.item_images = self._load_item_images()
+        self.state = "menu"
+        self.player_name = "Operator"
+        self.world: GameWorld | None = None
+        self.local_player_id: str | None = None
+        self.online = OnlineClient()
+        self.inventory_open = False
+        self.backpack_open = False
+        self.settings_open = False
+        self.craft_open = False
+        self.minimap_big = False
+        self.running = True
+        self.pending_reload = False
+        self.pending_pickup = False
+        self.pending_medkit = False
+        self.pending_interact = False
+        self.pending_respawn = False
+        self.pending_throw_grenade = False
+        self.pending_inventory_action: dict[str, object] | None = None
+        self.pending_craft_key: str | None = None
+        self.pending_repair_slot: str | None = None
+        self.pending_slot: str | None = None
+        self.pending_equip_armor: str | None = None
+        self.drag_source: dict[str, object] | None = None
+        self.settings = {
+            "bot_vision": True,
+            "bot_vision_range": True,
+            "ai_reactions": True,
+            "health_bars": True,
+            "noise_radius": True,
+        }
+        self.bot_density = "normal"
+        self.bot_density_profiles = {
+            "low": 0.65,
+            "normal": 1.0,
+            "high": 1.42,
+        }
+        self.difficulty_key = "medium"
+        self.difficulty_options = list(DIFFICULTY_KEYS)
+        self.server_entries: list[ServerEntry] = []
+        self.selected_server = 0
+        self._last_ping_refresh = 0.0
+        self._pinging = False
+        self._menu_buttons = [
+            Button(pygame.Rect(76, 318, 300, 52), "menu.single", "single"),
+            Button(pygame.Rect(76, 382, 300, 52), "menu.online", "online"),
+            Button(pygame.Rect(76, 446, 300, 52), "menu.settings", "options"),
+            Button(pygame.Rect(76, 510, 300, 52), "menu.quit", "quit"),
+        ]
+
+    def _load_locales(self) -> dict[str, dict[str, str]]:
+        locales: dict[str, dict[str, str]] = {}
+        for path in (ROOT / "locales").glob("*.json"):
+            locales[path.stem] = json.loads(path.read_text(encoding="utf-8"))
+        return locales or {"en": {}}
+
+    def tr(self, key: str, **values: object) -> str:
+        text = self.locales.get(self.language, {}).get(key) or self.locales.get("en", {}).get(key) or key
+        return text.format(**values) if values else text
+
+    def _load_item_images(self) -> dict[str, pygame.Surface]:
+        aliases = {
+            "grenade": "granade",
+            "gunpowder": "gun_powder",
+            "medicine": "medkit",
+            "light": "shield",
+            "medium": "shield",
+            "tactical": "shield",
+            "heavy": "shield",
+            "medium_head": "light_helmet",
+            "heavy_head": "light_helmet",
+            "light_torso": "shield",
+            "medium_torso": "shield",
+            "heavy_torso": "shield",
+            "light_arms": "shield",
+            "medium_arms": "shield",
+            "heavy_arms": "shield",
+            "light_legs": "shield",
+            "medium_legs": "shield",
+            "heavy_legs": "shield",
+        }
+        images: dict[str, pygame.Surface] = {}
+        image_dir = ROOT / "images"
+        for key in set(ITEMS) | set(WEAPONS) | {"heart", "shield", "light", "medium", "tactical", "heavy"}:
+            filename = aliases.get(key, key)
+            path = image_dir / f"{filename}.png"
+            if path.exists():
+                try:
+                    images[key] = pygame.image.load(str(path)).convert_alpha()
+                except pygame.error:
+                    pass
+        return images
+
+    def item_title(self, key: str) -> str:
+        return self.tr(f"item.{key}") if self.tr(f"item.{key}") != f"item.{key}" else ITEMS.get(key).title if key in ITEMS else key
+
+    def weapon_title(self, key: str) -> str:
+        return self.tr(f"weapon.{key}") if self.tr(f"weapon.{key}") != f"weapon.{key}" else WEAPONS.get(key).title if key in WEAPONS else key
+
+    def recipe_title(self, key: str) -> str:
+        return self.tr(f"recipe.{key}") if self.tr(f"recipe.{key}") != f"recipe.{key}" else RECIPES[key].title
+
+    def run(self) -> None:
+        while self.running:
+            dt = self.clock.tick(FPS) / 1000.0
+            self._handle_events()
+            self._update(dt)
+            self._draw()
+        self.online.close()
+        pygame.quit()
+
+    def _handle_events(self) -> None:
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT:
+                self.running = False
+            elif event.type == pygame.KEYDOWN:
+                self._handle_keydown(event.key)
+            elif event.type == pygame.MOUSEBUTTONDOWN:
+                self._handle_mouse_down(event)
+            elif event.type == pygame.MOUSEBUTTONUP:
+                self._handle_mouse_up(event)
+
+    def _handle_keydown(self, key: int) -> None:
+        if key == pygame.K_ESCAPE:
+            if self.backpack_open or self.inventory_open or self.settings_open or self.craft_open:
+                self.backpack_open = False
+                self.inventory_open = False
+                self.settings_open = False
+                self.craft_open = False
+            elif self.state == "servers":
+                self._back_to_menu()
+            elif self.state == "options":
+                self.state = "menu"
+            elif self.state in {"single", "online_game"}:
+                self.settings_open = True
+            return
+        if self.state not in {"single", "online_game"}:
+            return
+        if key in (pygame.K_i, pygame.K_b):
+            opening = not self.backpack_open
+            self.backpack_open = opening
+            self.inventory_open = opening
+            if opening:
+                self.craft_open = False
+                self.drag_source = None
+        elif key == pygame.K_o:
+            self.settings_open = not self.settings_open
+        elif key == pygame.K_c:
+            opening = not self.craft_open
+            self.craft_open = opening
+            if opening:
+                self.backpack_open = False
+                self.inventory_open = False
+                self.drag_source = None
+        elif key == pygame.K_r:
+            self.pending_reload = True
+        elif key == pygame.K_e:
+            self.pending_pickup = True
+        elif key == pygame.K_f:
+            self.pending_interact = True
+        elif key == pygame.K_SPACE:
+            self.pending_respawn = True
+        elif key == pygame.K_g:
+            self.pending_throw_grenade = True
+        elif key == pygame.K_m:
+            self.minimap_big = not self.minimap_big
+        elif key in (pygame.K_1, pygame.K_2, pygame.K_3, pygame.K_4, pygame.K_5, pygame.K_6, pygame.K_7, pygame.K_8, pygame.K_9):
+            self.pending_slot = str(key - pygame.K_0)
+        elif key == pygame.K_0:
+            self.pending_slot = "0"
+
+    def _handle_mouse_down(self, event: pygame.event.Event) -> None:
+        pos = event.pos
+        if self.backpack_open and self.state in {"single", "online_game"}:
+            snapshot = self._snapshot()
+            player = self._local_player(snapshot) if snapshot else None
+            repair_slot = self._repair_slot_at(pos)
+            if repair_slot:
+                self.pending_repair_slot = repair_slot
+                return
+            if event.button == 1:
+                self.drag_source = self._inventory_target_at(pos, player)
+            elif event.button == 3:
+                target = self._inventory_target_at(pos, player)
+                if target and target.get("source") == "backpack":
+                    self.pending_inventory_action = {"type": "use", "index": target["index"]}
+            return
+        if event.button == 1:
+            self._handle_click(pos)
+
+    def _handle_mouse_up(self, event: pygame.event.Event) -> None:
+        if event.button != 1:
+            return
+        if self.settings_open:
+            self._handle_settings_click(event.pos)
+            return
+        if self.craft_open:
+            self._handle_craft_click(event.pos)
+            return
+        if self.backpack_open and self.drag_source:
+            snapshot = self._snapshot()
+            player = self._local_player(snapshot) if snapshot else None
+            target = self._inventory_target_at(event.pos, player)
+            drop_rect = self._drop_rect()
+            outside_panel = not self._backpack_panel_rect().collidepoint(event.pos)
+            should_drop = bool(self._dragged_payload(player) and (drop_rect.collidepoint(event.pos) or outside_panel))
+            if target:
+                if self._is_repair_drag(player, self.drag_source):
+                    self.pending_inventory_action = self._repair_drag_action(self.drag_source, target)
+                elif self.drag_source["source"] == "weapon_slot" and target["source"] == "weapon_slot":
+                    self.pending_inventory_action = {"type": "quick_swap", "a": self.drag_source["slot"], "b": target["slot"]}
+                else:
+                    dst = "quick_item" if target["source"] == "weapon_slot" else target["source"]
+                    action = {"type": "move", "src": self.drag_source["source"], "dst": dst}
+                    if self.drag_source["source"] == "backpack":
+                        action["src_index"] = self.drag_source["index"]
+                    else:
+                        action["src_slot"] = self.drag_source["slot"]
+                    if dst == "backpack":
+                        action["dst_index"] = target["index"]
+                    elif dst in {"equipment", "quick_item"}:
+                        action["dst_slot"] = target["slot"]
+                    self.pending_inventory_action = action
+            elif should_drop:
+                action = {"type": "drop", "source": self.drag_source["source"]}
+                if self.drag_source["source"] == "backpack":
+                    action["index"] = self.drag_source["index"]
+                else:
+                    action["slot"] = self.drag_source["slot"]
+                self.pending_inventory_action = action
+            self.drag_source = None
+
+    def _handle_click(self, pos: tuple[int, int]) -> None:
+        if self.state == "menu":
+            for button in self._menu_buttons:
+                if button.hovered(pos):
+                    if button.action == "single":
+                        self._start_single_player()
+                    elif button.action == "online":
+                        self._show_servers()
+                    elif button.action == "options":
+                        self.state = "options"
+                    elif button.action == "quit":
+                        self.running = False
+        elif self.state == "options":
+            self._handle_settings_click(pos)
+        elif self.state == "servers":
+            self._handle_server_click(pos)
+        elif self.inventory_open and self.state in {"single", "online_game"}:
+            self._handle_inventory_click(pos)
+
+    def _handle_settings_click(self, pos: tuple[int, int]) -> None:
+        if self.state == "options" and self._settings_back_rect().collidepoint(pos):
+            self.state = "menu"
+            return
+        if self.state in {"single", "online_game"}:
+            if self._settings_resume_rect().collidepoint(pos):
+                self.settings_open = False
+                return
+            if self._settings_main_menu_rect().collidepoint(pos):
+                self._back_to_menu()
+                return
+        options = list(self.settings)
+        start_y, step_y = self._settings_grid()
+        for index, key in enumerate(options):
+            rect = pygame.Rect(478, start_y + index * step_y, 326, 40)
+            if rect.collidepoint(pos):
+                self.settings[key] = not self.settings[key]
+                return
+        density_rect = pygame.Rect(478, start_y + len(options) * step_y, 326, 40)
+        if density_rect.collidepoint(pos):
+            order = ["low", "normal", "high"]
+            self.bot_density = order[(order.index(self.bot_density) + 1) % len(order)]
+            return
+        difficulty_rect = pygame.Rect(478, start_y + (len(options) + 1) * step_y, 326, 40)
+        if difficulty_rect.collidepoint(pos):
+            index = self.difficulty_options.index(self.difficulty_key)
+            self.difficulty_key = self.difficulty_options[(index + 1) % len(self.difficulty_options)]
+            return
+        language_rect = pygame.Rect(478, start_y + (len(options) + 2) * step_y, 326, 40)
+        if language_rect.collidepoint(pos):
+            languages = sorted(self.locales)
+            self.language = languages[(languages.index(self.language) + 1) % len(languages)]
+
+    def _handle_craft_click(self, pos: tuple[int, int]) -> None:
+        for index, recipe_key in enumerate(RECIPES):
+            col = index % 2
+            row = index // 2
+            rect = pygame.Rect(342 + col * 304, 190 + row * 76, 284, 64)
+            if rect.collidepoint(pos):
+                self.pending_craft_key = recipe_key
+
+    def _handle_server_click(self, pos: tuple[int, int]) -> None:
+        if pygame.Rect(72, 632, 180, 46).collidepoint(pos):
+            self._back_to_menu()
+        if pygame.Rect(270, 632, 180, 46).collidepoint(pos):
+            self._refresh_pings()
+        if pygame.Rect(470, 632, 180, 46).collidepoint(pos):
+            self._connect_selected_server()
+        for index, _entry in enumerate(self.server_entries):
+            row = pygame.Rect(72, 190 + index * 72, 720, 56)
+            if row.collidepoint(pos):
+                self.selected_server = index
+
+    def _handle_inventory_click(self, pos: tuple[int, int]) -> None:
+        snapshot = self._snapshot()
+        player = self._local_player(snapshot) if snapshot else None
+        if not player:
+            return
+        panel = pygame.Rect(260, 110, 760, 540)
+        if not panel.collidepoint(pos):
+            return
+        armor_y = panel.y + 292
+        for index, armor_key in enumerate(player.owned_armors):
+            rect = pygame.Rect(panel.x + 42 + index * 172, armor_y, 152, 46)
+            if rect.collidepoint(pos):
+                self.pending_equip_armor = armor_key
+        if pygame.Rect(panel.x + 42, panel.y + 442, 158, 46).collidepoint(pos):
+            self.pending_medkit = True
+
+    def _update(self, dt: float) -> None:
+        if self.state == "servers" and time.time() - self._last_ping_refresh > 4.0:
+            self._refresh_pings()
+
+        if self.state == "single" and self.world and self.local_player_id:
+            if self.settings_open or self.backpack_open or self.craft_open:
+                if self.pending_inventory_action or self.pending_craft_key or self.pending_repair_slot:
+                    command = self._build_input(self.local_player_id)
+                    self.world.set_input(command)
+                    self.world.update(0.0)
+                    self._clear_transient_inputs()
+                return
+            command = self._build_input(self.local_player_id)
+            self.world.set_input(command)
+            self.world.update(dt)
+            self._clear_transient_inputs()
+        elif self.state == "online_game" and self.online.player_id:
+            command = self._build_input(self.online.player_id)
+            self.online.send_input(command)
+            self._clear_transient_inputs()
+
+    def _build_input(self, player_id: str) -> InputCommand:
+        keys = pygame.key.get_pressed()
+        move_x = float(keys[pygame.K_d] or keys[pygame.K_RIGHT]) - float(keys[pygame.K_a] or keys[pygame.K_LEFT])
+        move_y = float(keys[pygame.K_s] or keys[pygame.K_DOWN]) - float(keys[pygame.K_w] or keys[pygame.K_UP])
+        ui_open = self.backpack_open or self.settings_open or self.craft_open
+        if ui_open:
+            move_x = 0.0
+            move_y = 0.0
+        snapshot = self._snapshot()
+        player = self._local_player(snapshot) if snapshot else None
+        mouse_world = self._mouse_world(player)
+        if player and pygame.mouse.get_pressed(num_buttons=3)[2]:
+            to_mouse = Vec2(mouse_world.x - player.pos.x, mouse_world.y - player.pos.y)
+            if to_mouse.length() > 20:
+                direction = to_mouse.normalized()
+                move_x += direction.x
+                move_y += direction.y
+
+        return InputCommand(
+            player_id=player_id,
+            move_x=move_x,
+            move_y=move_y,
+            aim_x=mouse_world.x,
+            aim_y=mouse_world.y,
+            shooting=pygame.mouse.get_pressed(num_buttons=3)[0] and not ui_open,
+            reload=self.pending_reload,
+            pickup=self.pending_pickup,
+            interact=self.pending_interact,
+            use_medkit=self.pending_medkit,
+            sprint=keys[pygame.K_LSHIFT] or keys[pygame.K_RSHIFT],
+            sneak=keys[pygame.K_LCTRL] or keys[pygame.K_RCTRL],
+            respawn=self.pending_respawn,
+            throw_grenade=self.pending_throw_grenade,
+            inventory_action=self.pending_inventory_action,
+            craft_key=self.pending_craft_key,
+            repair_slot=self.pending_repair_slot,
+            active_slot=self.pending_slot,
+            equip_armor=self.pending_equip_armor,
+        )
+
+    def _clear_transient_inputs(self) -> None:
+        self.pending_reload = False
+        self.pending_pickup = False
+        self.pending_medkit = False
+        self.pending_interact = False
+        self.pending_respawn = False
+        self.pending_throw_grenade = False
+        self.pending_inventory_action = None
+        self.pending_craft_key = None
+        self.pending_repair_slot = None
+        self.pending_slot = None
+        self.pending_equip_armor = None
+
+    def _start_single_player(self) -> None:
+        self.online.close()
+        difficulty = load_difficulty(self.difficulty_key)
+        density = self.bot_density_profiles[self.bot_density]
+        initial_zombies = max(1, int(round(difficulty.initial_zombies * density)))
+        max_zombies = max(initial_zombies, int(round(difficulty.max_zombies * density)))
+        self.world = GameWorld(
+            seed=int(time.time()),
+            initial_zombies=initial_zombies,
+            max_zombies=max_zombies,
+            difficulty_key=self.difficulty_key,
+        )
+        player = self.world.add_player(self.player_name, "local")
+        self.local_player_id = player.id
+        self.inventory_open = False
+        self.backpack_open = False
+        self.settings_open = False
+        self.craft_open = False
+        self.state = "single"
+
+    def _show_servers(self) -> None:
+        self.state = "servers"
+        self.server_entries = self._load_servers()
+        self.selected_server = 0
+        self._refresh_pings()
+
+    def _connect_selected_server(self) -> None:
+        if not self.server_entries:
+            return
+        entry = self.server_entries[self.selected_server]
+        try:
+            self.online.connect(entry.host, entry.port, self.player_name)
+            self.world = None
+            self.inventory_open = False
+            self.state = "online_game"
+        except OSError as exc:
+            entry.status = f"error: {exc}"
+
+    def _back_to_menu(self) -> None:
+        self.online.close()
+        self.state = "menu"
+        self.inventory_open = False
+        self.backpack_open = False
+        self.settings_open = False
+        self.craft_open = False
+
+    def _load_servers(self) -> list[ServerEntry]:
+        path = ROOT / "servers.json"
+        if not path.exists():
+            return [ServerEntry("Local Dev", "127.0.0.1", 8765)]
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return [ServerEntry(str(row["name"]), str(row["host"]), int(row["port"])) for row in data]
+
+    def _refresh_pings(self) -> None:
+        if self._pinging:
+            return
+        self._pinging = True
+        self._last_ping_refresh = time.time()
+
+        def worker() -> None:
+            try:
+                for entry in self.server_entries:
+                    entry.status = "checking"
+                    ping, meta = ping_server(entry.host, entry.port)
+                    entry.ping_ms = ping
+                    entry.players = int(meta.get("players", 0)) if meta else 0
+                    entry.difficulty = str(meta.get("difficulty", entry.difficulty)) if meta else entry.difficulty
+                    entry.status = "online" if ping is not None else "offline"
+            finally:
+                self._pinging = False
+
+        threading.Thread(target=worker, name="server-ping", daemon=True).start()
+
+    def _snapshot(self) -> WorldSnapshot | None:
+        if self.state == "single" and self.world:
+            return self.world.snapshot()
+        if self.state == "online_game":
+            return self.online.latest_snapshot
+        return None
+
+    def _local_player(self, snapshot: WorldSnapshot | None) -> PlayerState | None:
+        if not snapshot:
+            return None
+        player_id = self.local_player_id if self.state == "single" else self.online.player_id
+        return snapshot.players.get(player_id or "")
+
+    def _camera(self, player: PlayerState | None) -> Vec2:
+        if not player:
+            return Vec2(0, 0)
+        return Vec2(
+            max(0, min(MAP_WIDTH - SCREEN_W, player.pos.x - SCREEN_W * 0.5)),
+            max(0, min(MAP_HEIGHT - SCREEN_H, player.pos.y - SCREEN_H * 0.5)),
+        )
+
+    def _mouse_world(self, player: PlayerState | None) -> Vec2:
+        mx, my = pygame.mouse.get_pos()
+        camera = self._camera(player)
+        return Vec2(mx + camera.x, my + camera.y)
+
+    def _world_to_screen(self, pos: Vec2, camera: Vec2) -> tuple[int, int]:
+        return int(pos.x - camera.x), int(pos.y - camera.y)
+
+    def _draw(self) -> None:
+        if self.state == "menu":
+            self._draw_menu()
+        elif self.state == "options":
+            self._draw_options_menu()
+        elif self.state == "servers":
+            self._draw_servers()
+        elif self.state in {"single", "online_game"}:
+            self._draw_game()
+        pygame.display.flip()
+
+    def _draw_menu(self) -> None:
+        self.screen.fill(BG)
+        self._draw_neon_background()
+        panel = pygame.Rect(48, 74, 390, 548)
+        pygame.draw.rect(self.screen, (10, 15, 25), panel, border_radius=10)
+        pygame.draw.rect(self.screen, CYAN, panel, 2, border_radius=10)
+        self._draw_text(self.tr("app.title"), 76, 116, TEXT, self.big)
+        self._draw_text(self.tr("menu.subtitle"), 78, 190, CYAN, self.font)
+        self._draw_text(self.tr("menu.caption"), 78, 222, MUTED, self.small)
+        for button in self._menu_buttons:
+            self._draw_button(button.rect, self.tr(button.label), button.hovered(pygame.mouse.get_pos()))
+        self._draw_menu_showcase()
+
+    def _draw_menu_showcase(self) -> None:
+        pygame.draw.rect(self.screen, (12, 18, 28), pygame.Rect(492, 96, 662, 500), border_radius=10)
+        pygame.draw.rect(self.screen, (58, 78, 108), pygame.Rect(492, 96, 662, 500), 2, border_radius=10)
+        for i in range(7):
+            pygame.draw.line(self.screen, (25, 38, 58), (530 + i * 88, 128), (460 + i * 118, 562), 2)
+        self._draw_text(self.tr("menu.systems"), 536, 132, TEXT, self.big)
+        cards = [
+            (self.tr("menu.card.stealth.title"), self.tr("menu.card.stealth.body"), CYAN),
+            (self.tr("menu.card.ai.title"), self.tr("menu.card.ai.body"), YELLOW),
+            (self.tr("menu.card.craft.title"), self.tr("menu.card.craft.body"), GREEN),
+        ]
+        for index, (title, body, color) in enumerate(cards):
+            rect = pygame.Rect(540, 226 + index * 94, 520, 72)
+            pygame.draw.rect(self.screen, PANEL, rect, border_radius=8)
+            pygame.draw.rect(self.screen, (54, 74, 104), rect, 1, border_radius=8)
+            pygame.draw.circle(self.screen, color, (rect.x + 34, rect.y + 36), 13)
+            pygame.draw.circle(self.screen, TEXT, (rect.x + 34, rect.y + 36), 13, 1)
+            self._draw_text(title, rect.x + 62, rect.y + 12, TEXT, self.mid)
+            self._draw_text(body, rect.x + 64, rect.y + 44, MUTED, self.small)
+
+    def _draw_options_menu(self) -> None:
+        self.screen.fill(BG)
+        self._draw_neon_background()
+        self._draw_settings(panel_only=True)
+
+    def _draw_servers(self) -> None:
+        self.screen.fill(BG)
+        self._draw_neon_background()
+        self._draw_text(self.tr("servers.title"), 72, 90, TEXT, self.big)
+        self._draw_text(self.tr("servers.caption"), 76, 150, MUTED)
+        for index, entry in enumerate(self.server_entries):
+            rect = pygame.Rect(72, 190 + index * 72, 720, 56)
+            selected = index == self.selected_server
+            pygame.draw.rect(self.screen, PANEL_2 if selected else PANEL, rect, border_radius=8)
+            pygame.draw.rect(self.screen, CYAN if selected else (45, 59, 91), rect, 2, border_radius=8)
+            self._draw_text(entry.name, rect.x + 18, rect.y + 9, TEXT, self.mid)
+            endpoint = f"{entry.host}:{entry.port}"
+            ping = "offline" if entry.ping_ms is None else f"{entry.ping_ms:.0f} ms"
+            difficulty = self.tr(f"difficulty.{entry.difficulty}") if entry.difficulty in self.difficulty_options else entry.difficulty
+            self._draw_text(endpoint, rect.x + 260, rect.y + 18, MUTED)
+            status = f"{ping}  {self.tr('servers.players')}: {entry.players}  {self.tr('servers.difficulty')}: {difficulty}"
+            self._draw_text_fit(status, pygame.Rect(rect.x + 485, rect.y + 18, 210, 22), GREEN if entry.ping_ms else RED, self.small)
+        self._draw_button(pygame.Rect(72, 632, 180, 46), self.tr("servers.back"), False)
+        self._draw_button(pygame.Rect(270, 632, 180, 46), self.tr("servers.refresh"), False)
+        self._draw_button(pygame.Rect(470, 632, 180, 46), self.tr("servers.connect"), False)
+
+    def _draw_game(self) -> None:
+        snapshot = self._snapshot()
+        player = self._local_player(snapshot)
+        camera = self._camera(player)
+        self.screen.fill(BG)
+        self._draw_world_background(camera)
+        if snapshot:
+            self._draw_buildings(snapshot, camera, player)
+            if player and self.settings["noise_radius"]:
+                self._draw_noise_radius(player, camera)
+            self._draw_loot(snapshot, camera)
+            self._draw_projectiles(snapshot, camera)
+            self._draw_grenades(snapshot, camera)
+            self._draw_zombies(snapshot, camera)
+            self._draw_players(snapshot, camera)
+            self._draw_hud(snapshot, player)
+            self._draw_minimap(snapshot, player)
+            self._draw_context_prompt(snapshot, player, camera)
+            if pygame.key.get_pressed()[pygame.K_TAB]:
+                self._draw_scoreboard(snapshot)
+            if player and not player.alive:
+                self._draw_death_overlay()
+            if self.backpack_open and player:
+                self._draw_backpack(player)
+            if self.craft_open and player:
+                self._draw_crafting(player)
+            if self.settings_open:
+                self._draw_settings()
+        if self.state == "online_game" and self.online.error:
+            self._draw_text(self.online.error, 26, SCREEN_H - 34, RED)
+
+    def _draw_neon_background(self) -> None:
+        for i in range(18):
+            x = 680 + i * 42
+            color = (18, 36 + i * 3 % 50, 58 + i * 4 % 90)
+            pygame.draw.line(self.screen, color, (x, 0), (x - 360, SCREEN_H), 2)
+        pygame.draw.circle(self.screen, (20, 62, 92), (1050, 180), 210, 2)
+        pygame.draw.circle(self.screen, (54, 31, 91), (1040, 180), 140, 2)
+
+    def _draw_world_background(self, camera: Vec2) -> None:
+        grid = 80
+        start_x = -int(camera.x) % grid
+        start_y = -int(camera.y) % grid
+        for x in range(start_x, SCREEN_W, grid):
+            pygame.draw.line(self.screen, (18, 25, 41), (x, 0), (x, SCREEN_H))
+        for y in range(start_y, SCREEN_H, grid):
+            pygame.draw.line(self.screen, (18, 25, 41), (0, y), (SCREEN_W, y))
+        pygame.draw.rect(
+            self.screen,
+            (34, 55, 76),
+            pygame.Rect(-camera.x, -camera.y, MAP_WIDTH, MAP_HEIGHT),
+            3,
+        )
+
+    def _draw_buildings(self, snapshot: WorldSnapshot, camera: Vec2, player: PlayerState | None) -> None:
+        for building in snapshot.buildings.values():
+            bx = int(building.bounds.x - camera.x)
+            by = int(building.bounds.y - camera.y)
+            rect = pygame.Rect(bx, by, int(building.bounds.w), int(building.bounds.h))
+            if not rect.colliderect(pygame.Rect(-120, -120, SCREEN_W + 240, SCREEN_H + 240)):
+                continue
+            player_inside = bool(player and player.inside_building == building.id)
+            fill = (18, 26, 34) if player_inside else (15, 20, 30)
+            outline = CYAN if player_inside else (55, 72, 94)
+            pygame.draw.rect(self.screen, fill, rect, border_radius=3)
+            pygame.draw.rect(self.screen, outline, rect, 2, border_radius=3)
+            if player_inside:
+                floor_label = f"{building.name} {self._floor_label(player.floor)}"
+                self._draw_text(floor_label, bx + 18, by + 14, CYAN, self.small)
+            for wall in building.walls:
+                self._draw_rect_world(wall, camera, (77, 91, 117))
+            for prop in building.props:
+                if prop.floor != (player.floor if player_inside and player else 0):
+                    continue
+                if not player_inside and prop.kind not in {"shelf", "crate", "barrel", "pallet", "roadblock"}:
+                    continue
+                color = (111, 92, 72) if prop.kind in {"desk", "table", "pallet"} else (110, 74, 54) if prop.kind == "barrel" else (82, 96, 124)
+                self._draw_rect_world(prop.rect, camera, color)
+            for stairs in building.stairs:
+                if player_inside or not player:
+                    self._draw_rect_world(stairs, camera, (86, 126, 164))
+                    sx, sy = self._world_to_screen(stairs.center, camera)
+                    self._draw_text("stairs", sx - 22, sy - 8, TEXT, self.small)
+            for door in building.doors:
+                color = GREEN if door.open else YELLOW
+                self._draw_rect_world(door.rect, camera, color)
+
+    def _draw_noise_radius(self, player: PlayerState, camera: Vec2) -> None:
+        if player.noise <= 0.0 or not player.alive:
+            return
+        sx, sy = self._world_to_screen(player.pos, camera)
+        radius = int(max(12, min(460, player.noise)))
+        surface = pygame.Surface((radius * 2 + 8, radius * 2 + 8), pygame.SRCALPHA)
+        color = (76, 225, 255, 30) if player.sneaking else (255, 210, 112, 34)
+        pygame.draw.circle(surface, color, (radius + 4, radius + 4), radius)
+        pygame.draw.circle(surface, (255, 255, 255, 48), (radius + 4, radius + 4), radius, 1)
+        self.screen.blit(surface, (sx - radius - 4, sy - radius - 4))
+
+    def _draw_rect_world(self, rect: RectState, camera: Vec2, color: tuple[int, int, int]) -> None:
+        screen_rect = pygame.Rect(
+            int(rect.x - camera.x),
+            int(rect.y - camera.y),
+            max(1, int(rect.w)),
+            max(1, int(rect.h)),
+        )
+        pygame.draw.rect(self.screen, color, screen_rect, border_radius=2)
+
+    def _draw_loot(self, snapshot: WorldSnapshot, camera: Vec2) -> None:
+        player = self._local_player(snapshot)
+        colors = {"weapon": CYAN, "ammo": YELLOW, "armor": PURPLE, "medkit": GREEN, "item": TEXT}
+        for item in snapshot.loot.values():
+            if player and item.floor != player.floor:
+                continue
+            sx, sy = self._world_to_screen(item.pos, camera)
+            if -30 <= sx <= SCREEN_W + 30 and -30 <= sy <= SCREEN_H + 30:
+                color = colors.get(item.kind, TEXT)
+                icon_key = item.payload if item.kind in {"item", "weapon", "armor"} else "ammo_pack" if item.kind == "ammo" else "medicine"
+                if item.kind == "item" and item.payload in ITEMS:
+                    color = ITEMS[item.payload].color
+                glow = 3 + int((math.sin(snapshot.time * 5.0 + sx * 0.01) + 1) * 2)
+                glow_rect = pygame.Rect(sx - 19 - glow, sy - 19 - glow, 38 + glow * 2, 38 + glow * 2)
+                pygame.draw.rect(self.screen, (*color,), glow_rect, 2, border_radius=5)
+                pygame.draw.rect(self.screen, (255, 255, 255), pygame.Rect(sx - 17, sy - 17, 34, 34), 1, border_radius=5)
+                if not self._draw_item_icon(icon_key, pygame.Rect(sx - 13, sy - 13, 26, 26)):
+                    pygame.draw.circle(self.screen, color, (sx, sy), 10)
+                label = self._loot_label(item)
+                self._draw_text(label, sx + 14, sy - 11, color, self.small)
+
+    def _draw_projectiles(self, snapshot: WorldSnapshot, camera: Vec2) -> None:
+        for projectile in snapshot.projectiles.values():
+            sx, sy = self._world_to_screen(projectile.pos, camera)
+            tail = Vec2(projectile.pos.x - projectile.velocity.x * 0.025, projectile.pos.y - projectile.velocity.y * 0.025)
+            tx, ty = self._world_to_screen(tail, camera)
+            pygame.draw.line(self.screen, (255, 244, 170), (tx, ty), (sx, sy), 4)
+            pygame.draw.circle(self.screen, (255, 255, 255), (sx, sy), 3)
+
+    def _draw_grenades(self, snapshot: WorldSnapshot, camera: Vec2) -> None:
+        player = self._local_player(snapshot)
+        for grenade in snapshot.grenades.values():
+            if player and grenade.floor != player.floor:
+                continue
+            sx, sy = self._world_to_screen(grenade.pos, camera)
+            pulse = int(6 + (2.0 - max(0.0, grenade.timer)) * 5)
+            pygame.draw.circle(self.screen, (10, 16, 12), (sx, sy), pulse + 5)
+            pygame.draw.circle(self.screen, GREEN if grenade.timer > 0.6 else RED, (sx, sy), pulse)
+            pygame.draw.circle(self.screen, YELLOW, (sx, sy), int(220 * max(0.0, 1.0 - grenade.timer / 2.0)), 1)
+
+    def _draw_zombies(self, snapshot: WorldSnapshot, camera: Vec2) -> None:
+        player = self._local_player(snapshot)
+        for zombie in snapshot.zombies.values():
+            if player and zombie.floor != player.floor:
+                continue
+            spec = ZOMBIES[zombie.kind]
+            sx, sy = self._world_to_screen(zombie.pos, camera)
+            if -80 <= sx <= SCREEN_W + 80 and -80 <= sy <= SCREEN_H + 80:
+                if self.settings["bot_vision"] and (self.settings["bot_vision_range"] or zombie.mode in {"chase", "investigate", "search"}):
+                    cone_len = spec.sight_range if self.settings["bot_vision_range"] else min(spec.sight_range, 160)
+                    left = zombie.facing - math.radians(spec.fov_degrees * 0.5)
+                    right = zombie.facing + math.radians(spec.fov_degrees * 0.5)
+                    points = [
+                        (sx, sy),
+                        (int(sx + math.cos(left) * cone_len), int(sy + math.sin(left) * cone_len)),
+                        (int(sx + math.cos(right) * cone_len), int(sy + math.sin(right) * cone_len)),
+                    ]
+                    cone = pygame.Surface((SCREEN_W, SCREEN_H), pygame.SRCALPHA)
+                    alpha = 18 if self.settings["bot_vision_range"] else 34
+                    pygame.draw.polygon(cone, (*spec.color, alpha), points)
+                    pygame.draw.arc(
+                        cone,
+                        (*spec.color, 68),
+                        pygame.Rect(sx - cone_len, sy - cone_len, cone_len * 2, cone_len * 2),
+                        -right,
+                        -left,
+                        1,
+                    )
+                    self.screen.blit(cone, (0, 0))
+                pygame.draw.circle(self.screen, (12, 18, 28), (sx, sy), int(spec.radius + 8))
+                pygame.draw.circle(self.screen, spec.color, (sx, sy), int(spec.radius))
+                pygame.draw.circle(self.screen, (255, 255, 255), (sx, sy), int(spec.radius), 2)
+                nose = (int(sx + math.cos(zombie.facing) * (spec.radius + 12)), int(sy + math.sin(zombie.facing) * (spec.radius + 12)))
+                pygame.draw.line(self.screen, TEXT, (sx, sy), nose, 2)
+                if self.settings["health_bars"]:
+                    self._bar(sx - 24, sy - int(spec.radius) - 15, 48, 5, zombie.health / max(1, spec.health), RED)
+                if self.settings["health_bars"] and zombie.armor > 0:
+                    self._bar(sx - 24, sy - int(spec.radius) - 8, 48, 4, zombie.armor / max(1, spec.armor), CYAN)
+                if self.settings["ai_reactions"]:
+                    mode_color = RED if zombie.mode == "chase" else YELLOW if zombie.mode in {"investigate", "search"} else MUTED
+                    self._draw_text(zombie.mode, sx - 22, sy + int(spec.radius) + 8, mode_color, self.small)
+
+    def _draw_players(self, snapshot: WorldSnapshot, camera: Vec2) -> None:
+        local = self._local_player(snapshot)
+        for player in snapshot.players.values():
+            if local and player.floor != local.floor:
+                continue
+            sx, sy = self._world_to_screen(player.pos, camera)
+            color = CYAN if player.id == (self.local_player_id or self.online.player_id) else GREEN
+            pygame.draw.circle(self.screen, (4, 8, 14), (sx, sy), 31)
+            pygame.draw.circle(self.screen, color, (sx, sy), 24)
+            pygame.draw.circle(self.screen, TEXT, (sx, sy), 24, 2)
+            muzzle = (int(sx + math.cos(player.angle) * 42), int(sy + math.sin(player.angle) * 42))
+            pygame.draw.line(self.screen, TEXT, (sx, sy), muzzle, 5)
+            self._draw_text(player.name, sx - 28, sy - 48, TEXT, self.small)
+
+    def _draw_hud(self, snapshot: WorldSnapshot, player: PlayerState | None) -> None:
+        if not player:
+            return
+        pygame.draw.rect(self.screen, PANEL, pygame.Rect(18, 18, 348, 132), border_radius=8)
+        self._draw_text(player.name, 74, 30, TEXT, self.mid)
+        if not self._draw_item_icon("heart", pygame.Rect(31, 67, 24, 24)):
+            pygame.draw.circle(self.screen, RED, (42, 78), 9)
+        self._bar(62, 70, 270, 16, player.health / 100.0, RED)
+        armor_max = max(1, ARMORS[player.armor_key].armor_points)
+        if not self._draw_item_icon("shield", pygame.Rect(31, 92, 24, 24)):
+            pygame.draw.rect(self.screen, CYAN, pygame.Rect(34, 91, 18, 18), 2, border_radius=3)
+        self._bar(62, 97, 270, 12, player.armor / armor_max, CYAN)
+        self._draw_text(f"{self.tr('hud.score')} {player.score}   {self.tr('hud.medkits')} {player.medkits}", 34, 116, MUTED, self.small)
+        noise_w = min(270, int(player.noise / 900 * 270))
+        pygame.draw.rect(self.screen, (33, 40, 58), pygame.Rect(62, 134, 270, 5), border_radius=2)
+        pygame.draw.rect(self.screen, YELLOW if player.sprinting else GREEN, pygame.Rect(62, 134, noise_w, 5), border_radius=2)
+
+        weapon = player.active_weapon()
+        weapon_title = self.tr("hud.unarmed")
+        ammo = "--"
+        reload_text = ""
+        if weapon:
+            spec = WEAPONS[weapon.key]
+            weapon_title = self.weapon_title(spec.key)
+            ammo = f"{weapon.ammo_in_mag}/{weapon.reserve_ammo}"
+            if weapon.reload_left > 0:
+                reload_text = f" {self.tr('hud.reloading')} {weapon.reload_left:.1f}s"
+        pygame.draw.circle(self.screen, YELLOW, (398, 44), 10)
+        self._draw_text(f"{weapon_title}  {ammo}{reload_text}", 426, 32, TEXT, self.mid)
+
+        start_x = 380
+        y = SCREEN_H - 72
+        for index, slot in enumerate(SLOTS):
+            rect = pygame.Rect(start_x + index * 82, y, 72, 50)
+            active = slot == player.active_slot
+            pygame.draw.rect(self.screen, PANEL_2 if active else PANEL, rect, border_radius=8)
+            pygame.draw.rect(self.screen, CYAN if active else (47, 61, 91), rect, 2, border_radius=8)
+            label = slot
+            weapon = player.weapons.get(slot)
+            quick_item = player.quick_items.get(slot)
+            if weapon:
+                label = f"{slot} {self.weapon_title(weapon.key).split()[0]}"
+                self._mini_durability(rect, weapon.durability)
+            elif quick_item:
+                label = f"{slot} {self.item_title(quick_item.key).split()[0]}"
+                self._draw_item_icon(quick_item.key, pygame.Rect(rect.x + 22, rect.y + 6, 28, 28))
+            self._draw_text(label, rect.x + 8, rect.y + 15, TEXT if weapon or quick_item else MUTED, self.small)
+
+    def _draw_minimap(self, snapshot: WorldSnapshot, player: PlayerState | None) -> None:
+        size = 226 if self.minimap_big else 156
+        rect = pygame.Rect(SCREEN_W - size - 18, 18, size, int(size * MAP_HEIGHT / MAP_WIDTH))
+        pygame.draw.rect(self.screen, PANEL, rect, border_radius=8)
+        pygame.draw.rect(self.screen, CYAN, rect, 2, border_radius=8)
+
+        def mp(pos: Vec2) -> tuple[int, int]:
+            return int(rect.x + pos.x / MAP_WIDTH * rect.w), int(rect.y + pos.y / MAP_HEIGHT * rect.h)
+
+        for item in snapshot.loot.values():
+            if player and item.floor != player.floor:
+                continue
+            pygame.draw.circle(self.screen, YELLOW, mp(item.pos), 2)
+        for zombie in snapshot.zombies.values():
+            if player and zombie.floor != player.floor:
+                continue
+            pygame.draw.circle(self.screen, RED, mp(zombie.pos), 3)
+        for other in snapshot.players.values():
+            pygame.draw.circle(self.screen, CYAN if player and other.id == player.id else GREEN, mp(other.pos), 4)
+        for building in snapshot.buildings.values():
+            mini = pygame.Rect(
+                int(rect.x + building.bounds.x / MAP_WIDTH * rect.w),
+                int(rect.y + building.bounds.y / MAP_HEIGHT * rect.h),
+                max(2, int(building.bounds.w / MAP_WIDTH * rect.w)),
+                max(2, int(building.bounds.h / MAP_HEIGHT * rect.h)),
+            )
+            pygame.draw.rect(self.screen, (84, 95, 118), mini, 1)
+
+    def _draw_context_prompt(self, snapshot: WorldSnapshot, player: PlayerState | None, camera: Vec2) -> None:
+        if not player or not player.alive:
+            return
+        prompt = ""
+        for building in snapshot.buildings.values():
+            for door in building.doors:
+                if door.rect.center.distance_to(player.pos) <= 86:
+                    prompt = self.tr("prompt.close_door") if door.open else self.tr("prompt.open_door")
+            for stairs in building.stairs:
+                if stairs.inflated(60).contains(player.pos):
+                    prompt = f"{self.tr('prompt.stairs')} ({self._floor_label(player.floor)})"
+            for prop in building.props:
+                if prop.floor != player.floor:
+                    continue
+                if prop.rect.center.distance_to(player.pos) <= 92 and prop.kind == "work_bench":
+                    prompt = self.tr("prompt.craft")
+                elif prop.rect.center.distance_to(player.pos) <= 92 and prop.kind == "repair_table":
+                    prompt = self.tr("prompt.repair")
+        for item in snapshot.loot.values():
+            if item.floor != player.floor:
+                continue
+            if item.pos.distance_to(player.pos) <= 72:
+                prompt = self.tr("prompt.pickup", item=self._loot_label(item))
+                break
+        if prompt:
+            sx, sy = self._world_to_screen(player.pos, camera)
+            label = self.font.render(prompt, True, TEXT)
+            bg = label.get_rect(center=(sx, sy - 72)).inflate(22, 12)
+            pygame.draw.rect(self.screen, PANEL, bg, border_radius=7)
+            pygame.draw.rect(self.screen, CYAN, bg, 1, border_radius=7)
+            self.screen.blit(label, label.get_rect(center=bg.center))
+
+    def _draw_scoreboard(self, snapshot: WorldSnapshot) -> None:
+        overlay = pygame.Surface((SCREEN_W, SCREEN_H), pygame.SRCALPHA)
+        overlay.fill((3, 7, 14, 190))
+        self.screen.blit(overlay, (0, 0))
+        panel = pygame.Rect(250, 96, 780, 520)
+        pygame.draw.rect(self.screen, PANEL, panel, border_radius=10)
+        pygame.draw.rect(self.screen, CYAN, panel, 2, border_radius=10)
+        self._draw_text(self.tr("scoreboard.title"), panel.x + 34, panel.y + 28, TEXT, self.big)
+        headers = [
+            self.tr("scoreboard.player"),
+            self.tr("scoreboard.total"),
+            self.tr("scoreboard.walker"),
+            self.tr("scoreboard.runner"),
+            self.tr("scoreboard.brute"),
+            self.tr("scoreboard.status"),
+        ]
+        xs = [panel.x + 42, panel.x + 310, panel.x + 400, panel.x + 500, panel.x + 600, panel.x + 690]
+        for x, header in zip(xs, headers):
+            self._draw_text(header, x, panel.y + 112, MUTED, self.small)
+        y = panel.y + 150
+        for player in sorted(snapshot.players.values(), key=lambda p: p.score, reverse=True):
+            pygame.draw.rect(self.screen, PANEL_2, pygame.Rect(panel.x + 30, y - 8, 720, 42), border_radius=6)
+            values = [
+                player.name,
+                str(player.score),
+                str(player.kills_by_kind.get("walker", 0)),
+                str(player.kills_by_kind.get("runner", 0)),
+                str(player.kills_by_kind.get("brute", 0)),
+                "alive" if player.alive else "dead",
+            ]
+            for x, value in zip(xs, values):
+                color = TEXT if value != "dead" else RED
+                self._draw_text(value, x, y, color, self.font)
+            y += 52
+
+    def _draw_death_overlay(self) -> None:
+        overlay = pygame.Surface((SCREEN_W, SCREEN_H), pygame.SRCALPHA)
+        overlay.fill((60, 4, 10, 126))
+        self.screen.blit(overlay, (0, 0))
+        text = self.big.render(self.tr("death.title"), True, TEXT)
+        self.screen.blit(text, text.get_rect(center=(SCREEN_W // 2, SCREEN_H // 2 - 44)))
+        if self.state == "online_game":
+            hint = self.mid.render(self.tr("death.online"), True, CYAN)
+        else:
+            hint = self.mid.render(self.tr("death.single"), True, CYAN)
+        self.screen.blit(hint, hint.get_rect(center=(SCREEN_W // 2, SCREEN_H // 2 + 22)))
+
+    def _draw_backpack(self, player: PlayerState) -> None:
+        overlay = pygame.Surface((SCREEN_W, SCREEN_H), pygame.SRCALPHA)
+        overlay.fill((2, 5, 12, 184))
+        self.screen.blit(overlay, (0, 0))
+        panel = self._backpack_panel_rect()
+        pygame.draw.rect(self.screen, PANEL, panel, border_radius=10)
+        pygame.draw.rect(self.screen, CYAN, panel, 2, border_radius=10)
+        self._draw_text(self.tr("backpack.title"), panel.x + 34, panel.y + 24, TEXT, self.big)
+        self._draw_text(self.tr("backpack.body"), panel.x + 54, panel.y + 116, PURPLE, self.mid)
+        self._draw_text(self.tr("backpack.help"), panel.x + 358, panel.y + 46, MUTED, self.small)
+
+        self._draw_text(self.tr("backpack.quickbar"), 390, 106, CYAN, self.mid)
+        for index, slot in enumerate(SLOTS):
+            rect = self._quick_rect(index)
+            active = player.active_slot == slot
+            pygame.draw.rect(self.screen, PANEL_2 if active else BG, rect, border_radius=8)
+            pygame.draw.rect(self.screen, CYAN if active else (52, 68, 98), rect, 2 if active else 1, border_radius=8)
+            self._draw_text(slot, rect.x + 6, rect.y + 5, MUTED, self.small)
+            weapon = player.weapons.get(slot)
+            quick_item = player.quick_items.get(slot)
+            if weapon and not self._is_dragging("weapon_slot", slot=slot):
+                self._draw_item_icon(weapon.key, pygame.Rect(rect.x + 16, rect.y + 11, 34, 34))
+                self._mini_durability(rect, weapon.durability)
+            elif quick_item and not self._is_dragging("quick_item", slot=slot):
+                self._draw_item(quick_item.key, quick_item.amount, rect)
+
+        for slot in EQUIPMENT_SLOTS:
+            rect = self._equipment_rect(slot)
+            item = player.equipment.get(slot)
+            pygame.draw.rect(self.screen, BG, rect, border_radius=8)
+            pygame.draw.rect(self.screen, PURPLE if item else (58, 58, 88), rect, 2, border_radius=8)
+            self._draw_text(self.tr(f"slot.{slot}"), rect.x + 12, rect.y + 10, MUTED, self.small)
+            if item and not self._is_dragging("equipment", slot=slot):
+                self._draw_item(item.key, item.amount, rect)
+                self._mini_durability(rect, item.durability)
+            repair = pygame.Rect(rect.right + 12, rect.y + 12, 70, 34)
+            pygame.draw.rect(self.screen, PANEL_2, repair, border_radius=6)
+            pygame.draw.rect(self.screen, YELLOW, repair, 1, border_radius=6)
+            self._draw_text(self.tr("backpack.repair"), repair.x + 10, repair.y + 8, TEXT, self.small)
+
+        for index in range(30):
+            rect = self._backpack_rect(index)
+            pygame.draw.rect(self.screen, BG, rect, border_radius=8)
+            pygame.draw.rect(self.screen, (52, 68, 98), rect, 1, border_radius=8)
+            item = player.backpack[index] if index < len(player.backpack) else None
+            if item and not self._is_dragging("backpack", index=index):
+                self._draw_item(item.key, item.amount, rect)
+
+        drop = self._drop_rect()
+        drop_hovered = bool(self.drag_source and drop.collidepoint(pygame.mouse.get_pos()))
+        pygame.draw.rect(self.screen, (60, 22, 30), drop, border_radius=8)
+        pygame.draw.rect(self.screen, YELLOW if drop_hovered else RED, drop, 2, border_radius=8)
+        self._draw_text(self.tr("backpack.drop"), drop.x + 44, drop.y + 20, TEXT, self.font)
+        self._draw_drag_preview(player)
+
+    def _draw_item(self, key: str, amount: int, rect: pygame.Rect) -> None:
+        spec = ITEMS.get(key)
+        color = spec.color if spec else TEXT
+        if not self._draw_item_icon(key, pygame.Rect(rect.x + 12, rect.y + 8, min(36, rect.w - 18), min(36, rect.h - 20))):
+            pygame.draw.circle(self.screen, color, rect.center, min(rect.w, rect.h) // 4)
+            pygame.draw.circle(self.screen, (255, 255, 255), rect.center, min(rect.w, rect.h) // 4, 1)
+        title = self.item_title(key)
+        self._draw_text(title[:12], rect.x + 6, rect.y + rect.h - 20, TEXT, self.small)
+        if amount > 1:
+            self._draw_text(str(amount), rect.right - 22, rect.y + 6, YELLOW, self.small)
+
+    def _draw_crafting(self, player: PlayerState) -> None:
+        overlay = pygame.Surface((SCREEN_W, SCREEN_H), pygame.SRCALPHA)
+        overlay.fill((2, 5, 12, 176))
+        self.screen.blit(overlay, (0, 0))
+        panel = pygame.Rect(300, 74, 680, 622)
+        pygame.draw.rect(self.screen, PANEL, panel, border_radius=10)
+        pygame.draw.rect(self.screen, GREEN, panel, 2, border_radius=10)
+        self._draw_text(self.tr("craft.title"), panel.x + 34, panel.y + 24, TEXT, self.big)
+        self._draw_text(self.tr("craft.caption"), panel.x + 38, panel.y + 90, MUTED, self.small)
+        for index, recipe in enumerate(RECIPES.values()):
+            col = index % 2
+            row = index // 2
+            rect = pygame.Rect(panel.x + 42 + col * 304, panel.y + 116 + row * 76, 284, 64)
+            can_craft = all(self._inventory_count(player, key) >= amount for key, amount in recipe.requires.items())
+            pygame.draw.rect(self.screen, PANEL_2 if can_craft else (18, 22, 33), rect, border_radius=8)
+            pygame.draw.rect(self.screen, GREEN if can_craft else (66, 72, 88), rect, 2 if can_craft else 1, border_radius=8)
+            result_key, result_amount = recipe.result
+            self._draw_text_fit(f"{self.recipe_title(recipe.key)} x{result_amount}", pygame.Rect(rect.x + 14, rect.y + 7, rect.w - 28, 20), TEXT, self.font)
+            req_x = rect.x + 14
+            req_y = rect.y + 33
+            for key, amount in recipe.requires.items():
+                have = self._inventory_count(player, key)
+                color = GREEN if have >= amount else RED
+                part = f"{self.item_title(key)} {have}/{amount}"
+                label_w = min(130, max(72, len(part) * 7))
+                if req_x + label_w > rect.right - 10:
+                    req_x = rect.x + 14
+                    req_y += 15
+                self._draw_text_fit(part, pygame.Rect(req_x, req_y, label_w, 15), color, self.small)
+                req_x += label_w + 8
+
+    def _draw_settings(self, panel_only: bool = False) -> None:
+        if not panel_only:
+            overlay = pygame.Surface((SCREEN_W, SCREEN_H), pygame.SRCALPHA)
+            overlay.fill((1, 3, 8, 166))
+            self.screen.blit(overlay, (0, 0))
+        panel = self._settings_panel_rect()
+        pygame.draw.rect(self.screen, PANEL, panel, border_radius=10)
+        pygame.draw.rect(self.screen, CYAN, panel, 2, border_radius=10)
+        title = self.tr("settings.title") if panel_only else self.tr("settings.pause")
+        self._draw_text_fit(title, pygame.Rect(panel.x + 34, panel.y + 24, panel.w - 68, 58), TEXT, self.big)
+        self._draw_text(self.tr("settings.caption"), panel.x + 38, panel.y + 88, MUTED, self.small)
+        labels = {
+            "bot_vision": self.tr("settings.bot_vision"),
+            "bot_vision_range": self.tr("settings.bot_vision_range"),
+            "ai_reactions": self.tr("settings.ai_reactions"),
+            "health_bars": self.tr("settings.health_bars"),
+            "noise_radius": self.tr("settings.noise_radius"),
+        }
+        start_y, step_y = self._settings_grid()
+        for index, key in enumerate(self.settings):
+            rect = pygame.Rect(478, start_y + index * step_y, 326, 40)
+            pygame.draw.rect(self.screen, PANEL_2, rect, border_radius=8)
+            pygame.draw.rect(self.screen, GREEN if self.settings[key] else MUTED, rect, 2, border_radius=8)
+            marker = self.tr("state.on") if self.settings[key] else self.tr("state.off")
+            self._draw_text_fit(labels[key], pygame.Rect(rect.x + 14, rect.y + 10, rect.w - 82, 20), TEXT, self.font)
+            self._draw_text(marker, rect.right - 58, rect.y + 10, GREEN if self.settings[key] else RED, self.font)
+        density_rect = pygame.Rect(478, start_y + len(self.settings) * step_y, 326, 40)
+        pygame.draw.rect(self.screen, PANEL_2, density_rect, border_radius=8)
+        pygame.draw.rect(self.screen, YELLOW, density_rect, 2, border_radius=8)
+        self._draw_text_fit(self.tr("settings.bot_density"), pygame.Rect(density_rect.x + 14, density_rect.y + 10, density_rect.w - 128, 20), TEXT, self.font)
+        self._draw_text_fit(self.tr(f"density.{self.bot_density}"), pygame.Rect(density_rect.right - 120, density_rect.y + 10, 104, 20), YELLOW, self.font)
+        difficulty_rect = pygame.Rect(478, start_y + (len(self.settings) + 1) * step_y, 326, 40)
+        pygame.draw.rect(self.screen, PANEL_2, difficulty_rect, border_radius=8)
+        pygame.draw.rect(self.screen, PURPLE, difficulty_rect, 2, border_radius=8)
+        self._draw_text_fit(self.tr("settings.difficulty"), pygame.Rect(difficulty_rect.x + 14, difficulty_rect.y + 10, difficulty_rect.w - 138, 20), TEXT, self.font)
+        self._draw_text_fit(self.tr(f"difficulty.{self.difficulty_key}"), pygame.Rect(difficulty_rect.right - 130, difficulty_rect.y + 10, 114, 20), PURPLE, self.font)
+        language_rect = pygame.Rect(478, start_y + (len(self.settings) + 2) * step_y, 326, 40)
+        pygame.draw.rect(self.screen, PANEL_2, language_rect, border_radius=8)
+        pygame.draw.rect(self.screen, CYAN, language_rect, 2, border_radius=8)
+        self._draw_text_fit(self.tr("settings.language"), pygame.Rect(language_rect.x + 14, language_rect.y + 10, language_rect.w - 78, 20), TEXT, self.font)
+        self._draw_text(self.language.upper(), language_rect.right - 58, language_rect.y + 10, CYAN, self.font)
+        if panel_only:
+            self._draw_button(self._settings_back_rect(), self.tr("settings.back"), False)
+        else:
+            self._draw_button(self._settings_resume_rect(), self.tr("settings.resume"), False)
+            self._draw_button(self._settings_main_menu_rect(), self.tr("settings.main_menu"), False)
+
+    def _backpack_rect(self, index: int) -> pygame.Rect:
+        col = index % 6
+        row = index // 6
+        return pygame.Rect(390 + col * 92, 210 + row * 78, 74, 62)
+
+    def _quick_rect(self, index: int) -> pygame.Rect:
+        return pygame.Rect(390 + index * 72, 142, 58, 54)
+
+    def _backpack_panel_rect(self) -> pygame.Rect:
+        return pygame.Rect(76, 58, 1128, 642)
+
+    def _drop_rect(self) -> pygame.Rect:
+        return pygame.Rect(1020, 590, 190, 64)
+
+    def _equipment_rect(self, slot: str) -> pygame.Rect:
+        order = {"head": 0, "torso": 1, "arms": 2, "legs": 3}
+        return pygame.Rect(126, 170 + order[slot] * 94, 134, 72)
+
+    def _repair_slot_at(self, pos: tuple[int, int]) -> str | None:
+        for slot in EQUIPMENT_SLOTS:
+            rect = self._equipment_rect(slot)
+            if pygame.Rect(rect.right + 12, rect.y + 12, 70, 34).collidepoint(pos):
+                return slot
+        return None
+
+    def _inventory_target_at(self, pos: tuple[int, int], player: PlayerState | None = None) -> dict[str, object] | None:
+        for index, slot in enumerate(SLOTS):
+            if self._quick_rect(index).collidepoint(pos):
+                if player and player.weapons.get(slot):
+                    return {"source": "weapon_slot", "slot": slot}
+                if player and player.quick_items.get(slot):
+                    return {"source": "quick_item", "slot": slot}
+                return {"source": "weapon_slot", "slot": slot}
+        for index in range(30):
+            if self._backpack_rect(index).collidepoint(pos):
+                return {"source": "backpack", "index": index}
+        for slot in EQUIPMENT_SLOTS:
+            if self._equipment_rect(slot).collidepoint(pos):
+                return {"source": "equipment", "slot": slot}
+        return None
+
+    def _inventory_count(self, player: PlayerState, key: str) -> int:
+        return sum(item.amount for item in player.backpack if item and item.key == key)
+
+    def _is_repair_drag(self, player: PlayerState | None, source: dict[str, object]) -> bool:
+        if not player or source.get("source") != "backpack":
+            return False
+        index = int(source.get("index", -1))
+        return 0 <= index < len(player.backpack) and bool(player.backpack[index] and player.backpack[index].key == "repair_kit")
+
+    def _repair_drag_action(self, source: dict[str, object], target: dict[str, object]) -> dict[str, object]:
+        action: dict[str, object] = {"type": "repair_drag", "kit_index": source["index"], "target_source": target["source"]}
+        if target["source"] == "backpack":
+            action["target_index"] = target["index"]
+        else:
+            action["target_slot"] = target["slot"]
+        return action
+
+    def _settings_panel_rect(self) -> pygame.Rect:
+        return pygame.Rect(430, 86, 420, 560)
+
+    def _settings_grid(self) -> tuple[int, int]:
+        return 150, 42
+
+    def _settings_back_rect(self) -> pygame.Rect:
+        return pygame.Rect(482, 588, 180, 42)
+
+    def _settings_resume_rect(self) -> pygame.Rect:
+        return pygame.Rect(396, 580, 152, 44)
+
+    def _settings_main_menu_rect(self) -> pygame.Rect:
+        return pygame.Rect(566, 580, 190, 44)
+
+    def _is_dragging(self, source: str, index: int | None = None, slot: str | None = None) -> bool:
+        if not self.drag_source or self.drag_source.get("source") != source:
+            return False
+        if index is not None and self.drag_source.get("index") != index:
+            return False
+        if slot is not None and self.drag_source.get("slot") != slot:
+            return False
+        return True
+
+    def _dragged_payload(self, player: PlayerState | None) -> tuple[str, int, float | None] | None:
+        if not player or not self.drag_source:
+            return None
+        source = str(self.drag_source.get("source", ""))
+        if source == "backpack":
+            index = int(self.drag_source.get("index", -1))
+            item = player.backpack[index] if 0 <= index < len(player.backpack) else None
+            return (item.key, item.amount, item.durability) if item else None
+        if source == "equipment":
+            item = player.equipment.get(str(self.drag_source.get("slot", "")))
+            return (item.key, item.amount, item.durability) if item else None
+        if source == "quick_item":
+            item = player.quick_items.get(str(self.drag_source.get("slot", "")))
+            return (item.key, item.amount, item.durability) if item else None
+        if source == "weapon_slot":
+            weapon = player.weapons.get(str(self.drag_source.get("slot", "")))
+            return (weapon.key, 1, weapon.durability) if weapon else None
+        return None
+
+    def _draw_drag_preview(self, player: PlayerState) -> None:
+        payload = self._dragged_payload(player)
+        if not payload:
+            return
+        key, amount, durability = payload
+        mx, my = pygame.mouse.get_pos()
+        rect = pygame.Rect(mx - 36, my - 32, 78, 66)
+        glow = pygame.Surface((rect.w + 14, rect.h + 14), pygame.SRCALPHA)
+        pygame.draw.rect(glow, (76, 225, 255, 48), glow.get_rect(), border_radius=12)
+        self.screen.blit(glow, (rect.x - 7, rect.y - 7))
+        pygame.draw.rect(self.screen, PANEL_2, rect, border_radius=9)
+        pygame.draw.rect(self.screen, CYAN, rect, 2, border_radius=9)
+        if not self._draw_item_icon(key, pygame.Rect(rect.x + 21, rect.y + 8, 36, 36)):
+            pygame.draw.circle(self.screen, YELLOW, (rect.centerx, rect.y + 26), 15)
+        title = self.weapon_title(key) if key in WEAPONS else self.item_title(key)
+        self._draw_text_fit(title.split()[0], pygame.Rect(rect.x + 6, rect.bottom - 20, rect.w - 12, 16), TEXT, self.small, center=True)
+        if amount > 1:
+            self._draw_text(str(amount), rect.right - 20, rect.y + 5, YELLOW, self.small)
+        if durability is not None:
+            self._mini_durability(rect, durability)
+
+    def _draw_item_icon(self, key: str, rect: pygame.Rect) -> bool:
+        image = self.item_images.get(key)
+        if not image:
+            return False
+        icon = pygame.transform.smoothscale(image, (rect.w, rect.h))
+        self.screen.blit(icon, rect)
+        return True
+
+    def _mini_durability(self, rect: pygame.Rect, durability: float) -> None:
+        color = GREEN if durability >= 55 else YELLOW if durability >= 25 else RED
+        bar = pygame.Rect(rect.x + 8, rect.bottom - 7, rect.w - 16, 4)
+        pygame.draw.rect(self.screen, (34, 38, 50), bar, border_radius=2)
+        pygame.draw.rect(self.screen, color, pygame.Rect(bar.x, bar.y, int(bar.w * max(0, min(100, durability)) / 100), bar.h), border_radius=2)
+
+    def _floor_label(self, floor: int) -> str:
+        if floor < 0:
+            return f"B{abs(floor)}"
+        return f"F{floor + 1}"
+
+    def _draw_inventory(self, player: PlayerState) -> None:
+        overlay = pygame.Surface((SCREEN_W, SCREEN_H), pygame.SRCALPHA)
+        overlay.fill((2, 5, 12, 168))
+        self.screen.blit(overlay, (0, 0))
+        panel = pygame.Rect(260, 110, 760, 540)
+        pygame.draw.rect(self.screen, PANEL, panel, border_radius=10)
+        pygame.draw.rect(self.screen, CYAN, panel, 2, border_radius=10)
+        self._draw_text("Inventory", panel.x + 38, panel.y + 26, TEXT, self.big)
+        self._draw_text("Weapons", panel.x + 42, panel.y + 118, CYAN, self.mid)
+        for index, slot in enumerate(SLOTS):
+            x = panel.x + 42 + (index % 5) * 136
+            y = panel.y + 158 + (index // 5) * 58
+            rect = pygame.Rect(x, y, 120, 42)
+            active = player.active_slot == slot
+            pygame.draw.rect(self.screen, PANEL_2 if active else BG, rect, border_radius=7)
+            pygame.draw.rect(self.screen, CYAN if active else (49, 62, 91), rect, 1, border_radius=7)
+            weapon = player.weapons.get(slot)
+            text = f"{slot}: empty"
+            if weapon:
+                text = f"{slot}: {WEAPONS[weapon.key].title.split()[0]}"
+            self._draw_text(text, rect.x + 10, rect.y + 12, TEXT if weapon else MUTED, self.small)
+
+        self._draw_text("Armor", panel.x + 42, panel.y + 250, PURPLE, self.mid)
+        armor_y = panel.y + 292
+        for index, armor_key in enumerate(player.owned_armors):
+            rect = pygame.Rect(panel.x + 42 + index * 172, armor_y, 152, 46)
+            active = player.armor_key == armor_key
+            pygame.draw.rect(self.screen, PANEL_2 if active else BG, rect, border_radius=7)
+            pygame.draw.rect(self.screen, PURPLE if active else (58, 58, 88), rect, 2, border_radius=7)
+            self._draw_text(ARMORS[armor_key].title, rect.x + 12, rect.y + 13, TEXT, self.small)
+
+        self._draw_text("Supplies", panel.x + 42, panel.y + 400, GREEN, self.mid)
+        med_rect = pygame.Rect(panel.x + 42, panel.y + 442, 158, 46)
+        pygame.draw.rect(self.screen, BG, med_rect, border_radius=7)
+        pygame.draw.rect(self.screen, GREEN, med_rect, 2, border_radius=7)
+        self._draw_text(f"Use medkit ({player.medkits})", med_rect.x + 12, med_rect.y + 13, TEXT, self.small)
+
+    def _loot_label(self, item: LootState) -> str:
+        if item.kind == "item" and item.payload in ITEMS:
+            return f"{self.item_title(item.payload)} x{item.amount}"
+        if item.kind == "weapon" and item.payload in WEAPONS:
+            return self.weapon_title(item.payload)
+        if item.kind == "armor" and item.payload in ARMORS:
+            return self.tr(f"armor.{item.payload}") if self.tr(f"armor.{item.payload}") != f"armor.{item.payload}" else ARMORS[item.payload].title
+        if item.kind == "ammo":
+            return f"{self.tr('item.ammo_pack')} +{item.amount}"
+        return self.tr("item.medicine")
+
+    def _draw_button(self, rect: pygame.Rect, label: str, hovered: bool) -> None:
+        pygame.draw.rect(self.screen, PANEL_2 if hovered else PANEL, rect, border_radius=8)
+        pygame.draw.rect(self.screen, CYAN if hovered else (53, 68, 98), rect, 2, border_radius=8)
+        self._draw_text_fit(label, rect.inflate(-20, -8), TEXT, self.mid, center=True)
+
+    def _draw_text(
+        self,
+        text: str,
+        x: int,
+        y: int,
+        color: tuple[int, int, int],
+        font: pygame.font.Font | None = None,
+    ) -> None:
+        surface = (font or self.font).render(text, True, color)
+        self.screen.blit(surface, (x, y))
+
+    def _draw_text_fit(
+        self,
+        text: str,
+        rect: pygame.Rect,
+        color: tuple[int, int, int],
+        font: pygame.font.Font | None = None,
+        center: bool = False,
+    ) -> None:
+        fonts = [font or self.font, self.font, self.small]
+        chosen = fonts[-1]
+        for candidate in fonts:
+            if candidate.size(text)[0] <= rect.w:
+                chosen = candidate
+                break
+        surface = chosen.render(text, True, color)
+        target = surface.get_rect(center=rect.center) if center else surface.get_rect(topleft=rect.topleft)
+        self.screen.blit(surface, target)
+
+    def _bar(self, x: int, y: int, w: int, h: int, ratio: float, color: tuple[int, int, int]) -> None:
+        ratio = max(0.0, min(1.0, ratio))
+        pygame.draw.rect(self.screen, (33, 40, 58), pygame.Rect(x, y, w, h), border_radius=4)
+        pygame.draw.rect(self.screen, color, pygame.Rect(x, y, int(w * ratio), h), border_radius=4)
+        pygame.draw.rect(self.screen, (100, 116, 150), pygame.Rect(x, y, w, h), 1, border_radius=4)
