@@ -105,6 +105,7 @@ class GameApp:
         self.craft_open = False
         self.weapon_custom_open = False
         self.minimap_big = False
+        self.craft_scroll = 0
         self.running = True
         self.pending_reload = False
         self.pending_pickup = False
@@ -245,6 +246,8 @@ class GameApp:
                 self._handle_mouse_down(event)
             elif event.type == pygame.MOUSEBUTTONUP:
                 self._handle_mouse_up(event)
+            elif event.type == pygame.MOUSEWHEEL:
+                self._handle_mouse_wheel(event)
 
     def _handle_keydown(self, key: int) -> None:
         if key == pygame.K_ESCAPE:
@@ -304,12 +307,18 @@ class GameApp:
 
     def _handle_mouse_down(self, event: pygame.event.Event) -> None:
         pos = event.pos
+        if self.craft_open and event.button in (4, 5):
+            self._scroll_crafting(-1 if event.button == 4 else 1)
+            return
         if self.backpack_open and self.state in {"single", "online_game"}:
             snapshot = self._snapshot()
             player = self._local_player(snapshot) if snapshot else None
             if self.weapon_custom_open:
                 if event.button == 1 and self._handle_weapon_custom_click(pos, player):
                     return
+                if event.button == 1:
+                    self.drag_source = self._inventory_target_at(pos, player)
+                return
             elif event.button == 1 and self._customize_button_rect().collidepoint(pos):
                 self.custom_weapon_slot = self._custom_weapon_slot(player)
                 self.weapon_custom_open = True
@@ -346,7 +355,15 @@ class GameApp:
             outside_panel = not self._backpack_panel_rect().collidepoint(event.pos)
             should_drop = bool(self._dragged_payload(player) and (drop_rect.collidepoint(event.pos) or outside_panel))
             if target:
-                if self._is_repair_drag(player, self.drag_source):
+                if target["source"] == "module_return" and self.drag_source["source"] == "weapon_module":
+                    self.pending_inventory_action = {
+                        "type": "unequip_module",
+                        "slot": self.drag_source["slot"],
+                        "module_slot": self.drag_source["module_slot"],
+                    }
+                elif target["source"] == "module_return":
+                    pass
+                elif self._is_repair_drag(player, self.drag_source):
                     self.pending_inventory_action = self._repair_drag_action(self.drag_source, target)
                 elif self.drag_source["source"] == "weapon_slot" and target["source"] == "weapon_slot":
                     self.pending_inventory_action = {"type": "quick_swap", "a": self.drag_source["slot"], "b": target["slot"]}
@@ -381,6 +398,10 @@ class GameApp:
                     action["slot"] = self.drag_source["slot"]
                 self.pending_inventory_action = action
             self.drag_source = None
+
+    def _handle_mouse_wheel(self, event: pygame.event.Event) -> None:
+        if self.craft_open:
+            self._scroll_crafting(-event.y)
 
     def _handle_click(self, pos: tuple[int, int]) -> None:
         if self.state == "menu":
@@ -435,6 +456,11 @@ class GameApp:
             self.language = languages[(languages.index(self.language) + 1) % len(languages)]
 
     def _handle_craft_click(self, pos: tuple[int, int]) -> None:
+        if self._craft_scroll_track_rect().collidepoint(pos):
+            self._set_craft_scroll_from_pointer(pos[1])
+            return
+        if not self._craft_viewport_rect().collidepoint(pos):
+            return
         for index, recipe_key in enumerate(RECIPES):
             if self._craft_recipe_rect(index).collidepoint(pos):
                 self.pending_craft_key = recipe_key
@@ -447,9 +473,23 @@ class GameApp:
         if not player:
             return False
         for index, slot in enumerate(SLOTS):
-            rect = pygame.Rect(412 + (index % 5) * 82, 238 + (index // 5) * 48, 70, 34)
+            rect = self._weapon_custom_slot_rect(index)
             if rect.collidepoint(pos) and player.weapons.get(slot):
                 self.custom_weapon_slot = slot
+                return True
+        weapon_slot = self._custom_weapon_slot(player)
+        for module_key, indices in self._available_module_groups(player):
+            rect = self._available_module_rect(module_key)
+            module = WEAPON_MODULES.get(module_key)
+            if rect.collidepoint(pos) and module and indices and player.weapons.get(weapon_slot):
+                self.pending_inventory_action = {
+                    "type": "move",
+                    "src": "backpack",
+                    "dst": "weapon_module",
+                    "src_index": indices[0],
+                    "dst_slot": weapon_slot,
+                    "dst_module": module.slot,
+                }
                 return True
         return False
 
@@ -1547,14 +1587,44 @@ class GameApp:
     def _craft_panel_rect(self) -> pygame.Rect:
         return pygame.Rect(126, 56, 1028, 648)
 
-    def _craft_recipe_rect(self, index: int) -> pygame.Rect:
+    def _craft_viewport_rect(self) -> pygame.Rect:
         panel = self._craft_panel_rect()
-        card_w = 226
-        card_h = 88
-        gap = 14
-        col = index % 4
-        row = index // 4
-        return pygame.Rect(panel.x + 42 + col * (card_w + gap), panel.y + 126 + row * (card_h + gap), card_w, card_h)
+        return pygame.Rect(panel.x + 34, panel.y + 126, panel.w - 86, panel.h - 164)
+
+    def _craft_scroll_track_rect(self) -> pygame.Rect:
+        viewport = self._craft_viewport_rect()
+        return pygame.Rect(viewport.right + 14, viewport.y, 10, viewport.h)
+
+    def _craft_card_metrics(self) -> tuple[int, int, int, int]:
+        return 294, 112, 18, 3
+
+    def _craft_content_height(self) -> int:
+        card_w, card_h, gap, cols = self._craft_card_metrics()
+        rows = max(1, math.ceil(len(RECIPES) / cols))
+        return rows * card_h + max(0, rows - 1) * gap
+
+    def _craft_max_scroll(self) -> int:
+        return max(0, self._craft_content_height() - self._craft_viewport_rect().h)
+
+    def _scroll_crafting(self, direction: int) -> None:
+        self.craft_scroll = max(0, min(self._craft_max_scroll(), self.craft_scroll + direction * 78))
+
+    def _set_craft_scroll_from_pointer(self, y: int) -> None:
+        track = self._craft_scroll_track_rect()
+        max_scroll = self._craft_max_scroll()
+        if max_scroll <= 0:
+            self.craft_scroll = 0
+            return
+        knob_h = max(42, int(track.h * track.h / max(track.h, self._craft_content_height())))
+        ratio = (y - track.y - knob_h * 0.5) / max(1, track.h - knob_h)
+        self.craft_scroll = max(0, min(max_scroll, int(max_scroll * ratio)))
+
+    def _craft_recipe_rect(self, index: int) -> pygame.Rect:
+        viewport = self._craft_viewport_rect()
+        card_w, card_h, gap, cols = self._craft_card_metrics()
+        col = index % cols
+        row = index // cols
+        return pygame.Rect(viewport.x + col * (card_w + gap), viewport.y + row * (card_h + gap) - self.craft_scroll, card_w, card_h)
 
     def _recipe_result_kind(self, recipe_key: str) -> str:
         recipe = RECIPES[recipe_key]
@@ -1565,6 +1635,7 @@ class GameApp:
         return spec.kind if spec else "item"
 
     def _draw_crafting(self, player: PlayerState) -> None:
+        self.craft_scroll = max(0, min(self._craft_max_scroll(), self.craft_scroll))
         overlay = pygame.Surface((SCREEN_W, SCREEN_H), pygame.SRCALPHA)
         overlay.fill((2, 5, 12, 190))
         self.screen.blit(overlay, (0, 0))
@@ -1581,8 +1652,31 @@ class GameApp:
         self._draw_craft_rarity_odds(odds.x + 156, odds.y + 11, "preview", "item", large=True)
 
         mouse = pygame.mouse.get_pos()
+        viewport = self._craft_viewport_rect()
+        pygame.draw.rect(self.screen, (9, 13, 23), viewport.inflate(12, 12), border_radius=10)
+        pygame.draw.rect(self.screen, (42, 57, 82), viewport.inflate(12, 12), 1, border_radius=10)
+        previous_clip = self.screen.get_clip()
+        self.screen.set_clip(viewport)
         for index, recipe in enumerate(RECIPES.values()):
-            self._draw_craft_card(player, recipe.key, self._craft_recipe_rect(index), mouse)
+            rect = self._craft_recipe_rect(index)
+            if rect.colliderect(viewport.inflate(18, 18)):
+                self._draw_craft_card(player, recipe.key, rect, mouse)
+        self.screen.set_clip(previous_clip)
+        self._draw_craft_scrollbar()
+
+    def _draw_craft_scrollbar(self) -> None:
+        track = self._craft_scroll_track_rect()
+        pygame.draw.rect(self.screen, (8, 12, 20), track, border_radius=5)
+        pygame.draw.rect(self.screen, (52, 68, 98), track, 1, border_radius=5)
+        max_scroll = self._craft_max_scroll()
+        if max_scroll <= 0:
+            pygame.draw.rect(self.screen, GREEN, track.inflate(-2, -2), border_radius=4)
+            return
+        knob_h = max(42, int(track.h * track.h / max(track.h, self._craft_content_height())))
+        knob_y = track.y + int((track.h - knob_h) * (self.craft_scroll / max_scroll))
+        knob = pygame.Rect(track.x + 2, knob_y, track.w - 4, knob_h)
+        pygame.draw.rect(self.screen, GREEN, knob, border_radius=4)
+        pygame.draw.rect(self.screen, (202, 255, 218), knob, 1, border_radius=4)
 
     def _draw_craft_card(self, player: PlayerState, recipe_key: str, rect: pygame.Rect, mouse: tuple[int, int]) -> None:
         recipe = RECIPES[recipe_key]
@@ -1605,31 +1699,31 @@ class GameApp:
             shade.fill((0, 0, 0, 46))
             self.screen.blit(shade, rect)
 
-        result_rect = pygame.Rect(rect.x + 12, rect.y + 14, 54, 54)
+        result_rect = pygame.Rect(rect.x + 14, rect.y + 18, 68, 68)
         result_color = rarity_color("uncommon") if result_kind in {"armor", "weapon_module"} else self._icon_color(result_key)
         pygame.draw.rect(self.screen, (7, 11, 19), result_rect, border_radius=8)
         pygame.draw.rect(self.screen, result_color, result_rect, 2, border_radius=8)
-        if not self._draw_item_icon(result_key, result_rect.inflate(-12, -12), aura=False):
-            pygame.draw.circle(self.screen, result_color, result_rect.center, 15)
+        if not self._draw_item_icon(result_key, result_rect.inflate(-10, -10), aura=False):
+            pygame.draw.circle(self.screen, result_color, result_rect.center, 18)
         if result_amount > 1:
             self._draw_text(str(result_amount), result_rect.right - 14, result_rect.bottom - 18, YELLOW, self.small)
 
         title_color = TEXT if can_craft else MUTED
-        self._draw_text_fit(self.recipe_title(recipe.key), pygame.Rect(rect.x + 76, rect.y + 9, rect.w - 88, 18), title_color, self.small)
-        self._draw_craft_rarity_odds(rect.x + 76, rect.y + 31, recipe.key, result_kind)
+        self._draw_text_fit(self.recipe_title(recipe.key), pygame.Rect(rect.x + 96, rect.y + 12, rect.w - 110, 20), title_color, self.font)
+        self._draw_craft_rarity_odds(rect.x + 96, rect.y + 39, recipe.key, result_kind)
 
-        req_x = rect.x + 76
-        req_y = rect.y + 53
+        req_x = rect.x + 96
+        req_y = rect.y + 72
         for index, (key, amount) in enumerate(recipe.requires.items()):
             have = self._inventory_count(player, key)
             filled = have >= amount
-            req_rect = pygame.Rect(req_x + index * 36, req_y, 32, 28)
+            req_rect = pygame.Rect(req_x + index * 42, req_y, 36, 32)
             pygame.draw.rect(self.screen, (7, 11, 19), req_rect, border_radius=6)
             pygame.draw.rect(self.screen, GREEN if filled else RED, req_rect, 1, border_radius=6)
-            if not self._draw_item_icon(key, pygame.Rect(req_rect.x + 5, req_rect.y + 3, 18, 18), aura=False, shadow=False):
-                pygame.draw.circle(self.screen, GREEN if filled else RED, (req_rect.x + 14, req_rect.y + 12), 7)
+            if not self._draw_item_icon(key, pygame.Rect(req_rect.x + 5, req_rect.y + 3, 22, 22), aura=False, shadow=False):
+                pygame.draw.circle(self.screen, GREEN if filled else RED, (req_rect.x + 16, req_rect.y + 14), 8)
             count_color = GREEN if filled else RED
-            self._draw_text_fit(f"{min(have, 99)}/{amount}", pygame.Rect(req_rect.x + 1, req_rect.bottom - 10, req_rect.w - 2, 9), count_color, self.small, center=True)
+            self._draw_text_fit(f"{min(have, 99)}/{amount}", pygame.Rect(req_rect.x + 1, req_rect.bottom - 11, req_rect.w - 2, 10), count_color, self.small, center=True)
 
     def _draw_craft_rarity_odds(self, x: int, y: int, recipe_key: str, result_kind: str, large: bool = False) -> None:
         chances = craft_rarity_chances(recipe_key, result_kind)
@@ -1640,7 +1734,7 @@ class GameApp:
                 continue
             color = rarity_color(rarity)
             icon_size = 18 if large else 12
-            chip_w = 52 if large else 34
+            chip_w = 52 if large else 42
             chip_h = 36 if large else 16
             chip = pygame.Rect(cursor, y, chip_w, chip_h)
             pygame.draw.rect(self.screen, (8, 12, 20), chip, border_radius=6)
@@ -1655,49 +1749,66 @@ class GameApp:
 
     def _draw_weapon_customization(self, player: PlayerState) -> None:
         overlay = pygame.Surface((SCREEN_W, SCREEN_H), pygame.SRCALPHA)
-        overlay.fill((3, 6, 14, 118))
+        overlay.fill((3, 6, 14, 148))
         self.screen.blit(overlay, (0, 0))
         panel = self._weapon_custom_panel_rect()
         pygame.draw.rect(self.screen, PANEL, panel, border_radius=10)
+        pygame.draw.rect(self.screen, (55, 38, 88), panel.inflate(8, 8), 1, border_radius=12)
         pygame.draw.rect(self.screen, PURPLE, panel, 2, border_radius=10)
-        self._draw_text_fit(self.tr("weaponmods.title"), pygame.Rect(panel.x + 28, panel.y + 20, 360, 44), TEXT, self.mid)
+        self._draw_text_fit(self.tr("weaponmods.title"), pygame.Rect(panel.x + 28, panel.y + 18, 420, 44), TEXT, self.mid)
+        self._draw_text_fit(self.tr("weaponmods.click_install"), pygame.Rect(panel.x + 32, panel.y + 54, 560, 20), MUTED, self.small)
         self._draw_button(self._weapon_custom_close_rect(), self.tr("weaponmods.close"), False)
 
-        self._draw_text(self.tr("weaponmods.weapon"), panel.x + 34, panel.y + 74, MUTED, self.small)
+        self._draw_text(self.tr("weaponmods.weapon"), panel.x + 34, panel.y + 76, MUTED, self.small)
         for index, slot in enumerate(SLOTS):
-            rect = pygame.Rect(412 + (index % 5) * 82, 238 + (index // 5) * 48, 70, 34)
+            rect = self._weapon_custom_slot_rect(index)
             weapon = player.weapons.get(slot)
             selected = slot == self._custom_weapon_slot(player)
-            pygame.draw.rect(self.screen, PANEL_2 if selected else BG, rect, border_radius=6)
-            pygame.draw.rect(self.screen, CYAN if selected else (52, 68, 98), rect, 2 if selected else 1, border_radius=6)
-            label = slot if not weapon else f"{slot} {self.weapon_title(weapon.key).split()[0]}"
-            self._draw_text_fit(label, rect.inflate(-8, -6), TEXT if weapon else MUTED, self.small, center=True)
+            pygame.draw.rect(self.screen, PANEL_2 if selected else BG, rect, border_radius=8)
+            pygame.draw.rect(self.screen, CYAN if selected else (52, 68, 98), rect, 2 if selected else 1, border_radius=8)
+            self._draw_text(slot, rect.x + 6, rect.y + 5, MUTED, self.small)
+            if weapon:
+                if selected:
+                    self._draw_rarity_frame(rect, weapon.rarity)
+                self._draw_item_icon(weapon.key, pygame.Rect(rect.x + 28, rect.y + 7, 38, 28), aura=False)
+                self._draw_text_fit(self.weapon_title(weapon.key).split()[0], pygame.Rect(rect.x + 8, rect.bottom - 18, rect.w - 16, 14), TEXT, self.small, center=True)
+            else:
+                self._draw_text_fit(slot, rect.inflate(-8, -10), MUTED, self.small, center=True)
 
         weapon_slot = self._custom_weapon_slot(player)
         weapon = player.weapons.get(weapon_slot)
         if not weapon:
-            self._draw_text(self.tr("weaponmods.empty"), panel.x + 42, panel.y + 170, MUTED, self.font)
+            empty = pygame.Rect(panel.x + 34, panel.y + 168, panel.w - 68, 180)
+            pygame.draw.rect(self.screen, BG, empty, border_radius=10)
+            pygame.draw.rect(self.screen, (58, 68, 92), empty, 1, border_radius=10)
+            self._draw_text_fit(self.tr("weaponmods.empty"), empty.inflate(-40, -40), MUTED, self.font, center=True)
             return
         mag_size = self._client_weapon_magazine_size(weapon)
-        weapon_rect = pygame.Rect(panel.x + 32, panel.y + 116, 66, 56)
+        info = pygame.Rect(panel.x + 34, panel.y + 164, 292, 210)
+        pygame.draw.rect(self.screen, (12, 17, 29), info, border_radius=10)
+        pygame.draw.rect(self.screen, rarity_color(weapon.rarity), info, 2, border_radius=10)
+        weapon_rect = pygame.Rect(info.x + 18, info.y + 34, 104, 88)
         self._draw_rarity_frame(weapon_rect, weapon.rarity)
         self._draw_rarity_badge(weapon_rect, weapon.rarity, compact=True)
-        self._draw_item_icon(weapon.key, pygame.Rect(panel.x + 38, panel.y + 122, 54, 44))
+        self._draw_item_icon(weapon.key, weapon_rect.inflate(-14, -18))
         self._draw_text_fit(
             f"{self.rarity_title(weapon.rarity)} {self.weapon_title(weapon.key)}",
-            pygame.Rect(panel.x + 104, panel.y + 122, 280, 24),
+            pygame.Rect(info.x + 136, info.y + 34, 138, 34),
             rarity_color(weapon.rarity),
             self.font,
         )
-        self._draw_text(f"{self.tr('weaponmods.magazine')}: {mag_size}", panel.x + 104, panel.y + 150, MUTED, self.small)
-        self._draw_text(self.tr("weaponmods.drag"), panel.x + 42, panel.y + 208, MUTED, self.small)
+        self._draw_text_fit(f"{self.tr('weaponmods.magazine')}: {mag_size}", pygame.Rect(info.x + 136, info.y + 78, 130, 18), MUTED, self.small)
+        utility_title = self.item_title(weapon.modules["utility"]) if weapon.modules.get("utility") else self.tr("weaponmods.empty_slot")
+        magazine_title = self.item_title(weapon.modules["magazine"]) if weapon.modules.get("magazine") else self.tr("weaponmods.empty_slot")
+        self._draw_text_fit(f"{self.tr('weaponmods.slot.utility')}: {utility_title}", pygame.Rect(info.x + 20, info.y + 142, 250, 18), TEXT, self.small)
+        self._draw_text_fit(f"{self.tr('weaponmods.slot.magazine')}: {magazine_title}", pygame.Rect(info.x + 20, info.y + 166, 250, 18), TEXT, self.small)
 
         for module_slot in WEAPON_MODULE_SLOTS:
             rect = self._weapon_module_rect(module_slot)
             module_key = weapon.modules.get(module_slot)
-            pygame.draw.rect(self.screen, PANEL_2 if module_key else BG, rect, border_radius=8)
-            pygame.draw.rect(self.screen, GREEN if module_key else (58, 68, 92), rect, 2, border_radius=8)
-            self._draw_text(self.tr(f"weaponmods.slot.{module_slot}"), rect.x + 12, rect.y + 10, MUTED, self.small)
+            pygame.draw.rect(self.screen, PANEL_2 if module_key else BG, rect, border_radius=10)
+            pygame.draw.rect(self.screen, GREEN if module_key else (58, 68, 92), rect, 2, border_radius=10)
+            self._draw_text_fit(self.tr(f"weaponmods.slot.{module_slot}"), pygame.Rect(rect.x + 14, rect.y + 12, rect.w - 28, 18), MUTED, self.small)
             dragging_this_module = (
                 self.drag_source
                 and self.drag_source.get("source") == "weapon_module"
@@ -1705,10 +1816,41 @@ class GameApp:
                 and self.drag_source.get("module_slot") == module_slot
             )
             if module_key and not dragging_this_module:
-                self._draw_item_icon(module_key, pygame.Rect(rect.x + 18, rect.y + 28, 44, 38))
-                self._draw_text_fit(self.item_title(module_key), pygame.Rect(rect.x + 70, rect.y + 34, 92, 20), TEXT, self.small)
+                self._draw_item_icon(module_key, pygame.Rect(rect.x + 18, rect.y + 38, 58, 54))
+                self._draw_text_fit(self.item_title(module_key), pygame.Rect(rect.x + 86, rect.y + 42, rect.w - 100, 20), TEXT, self.font)
+                self._draw_text_fit(self._module_effect_text(module_key), pygame.Rect(rect.x + 86, rect.y + 70, rect.w - 100, 18), GREEN, self.small)
+                self._draw_text_fit(self.tr("weaponmods.drag_remove"), pygame.Rect(rect.x + 18, rect.bottom - 24, rect.w - 36, 16), MUTED, self.small)
             else:
-                self._draw_text_fit(self.tr("weaponmods.empty_slot"), pygame.Rect(rect.x + 12, rect.y + 40, rect.w - 24, 20), MUTED, self.small, center=True)
+                self._draw_text_fit(self.tr("weaponmods.empty_slot"), pygame.Rect(rect.x + 18, rect.y + 48, rect.w - 36, 28), MUTED, self.font, center=True)
+
+        return_rect = self._weapon_module_return_rect()
+        return_hot = bool(self.drag_source and self.drag_source.get("source") == "weapon_module")
+        pygame.draw.rect(self.screen, (12, 17, 29), return_rect, border_radius=9)
+        pygame.draw.rect(self.screen, CYAN if return_hot else (58, 68, 92), return_rect, 2 if return_hot else 1, border_radius=9)
+        self._draw_text_fit(self.tr("weaponmods.return_bay"), return_rect.inflate(-24, -12), CYAN if return_hot else MUTED, self.small, center=True)
+
+        self._draw_text(self.tr("weaponmods.available"), panel.x + 34, panel.y + 388, TEXT, self.mid)
+        self._draw_text_fit(self.tr("weaponmods.click_install"), pygame.Rect(panel.x + 250, panel.y + 396, 490, 18), MUTED, self.small)
+        for module_key, indices in self._available_module_groups(player):
+            rect = self._available_module_rect(module_key)
+            module = WEAPON_MODULES[module_key]
+            available = len(indices)
+            installed_here = weapon.modules.get(module.slot) == module_key
+            accent = GREEN if available else MUTED
+            if installed_here:
+                accent = CYAN
+            if available:
+                glow_rect = rect.inflate(10, 10)
+                glow = pygame.Surface(glow_rect.size, pygame.SRCALPHA)
+                pygame.draw.rect(glow, (*accent, 28), glow.get_rect(), border_radius=12)
+                self.screen.blit(glow, glow_rect)
+            pygame.draw.rect(self.screen, PANEL_2 if available else BG, rect, border_radius=10)
+            pygame.draw.rect(self.screen, accent, rect, 2 if available or installed_here else 1, border_radius=10)
+            self._draw_item_icon(module_key, pygame.Rect(rect.x + 14, rect.y + 22, 54, 50), aura=False)
+            self._draw_text_fit(self.item_title(module_key), pygame.Rect(rect.x + 76, rect.y + 18, rect.w - 88, 20), TEXT if available else MUTED, self.font)
+            self._draw_text_fit(self._module_effect_text(module_key), pygame.Rect(rect.x + 76, rect.y + 44, rect.w - 88, 18), GREEN if available else MUTED, self.small)
+            count_text = self.tr("weaponmods.installed") if installed_here and not available else f"x{available}"
+            self._draw_text_fit(count_text, pygame.Rect(rect.x + 76, rect.y + 68, rect.w - 88, 18), CYAN if installed_here else YELLOW if available else MUTED, self.small)
 
     def _client_weapon_magazine_size(self, weapon: object) -> int:
         base = WEAPONS[weapon.key].magazine_size
@@ -1801,16 +1943,30 @@ class GameApp:
         return pygame.Rect(1020, 514, 190, 54)
 
     def _weapon_custom_panel_rect(self) -> pygame.Rect:
-        return pygame.Rect(360, 172, 560, 390)
+        return pygame.Rect(138, 92, 1004, 578)
 
     def _weapon_custom_close_rect(self) -> pygame.Rect:
         panel = self._weapon_custom_panel_rect()
-        return pygame.Rect(panel.right - 104, panel.y + 22, 74, 34)
+        return pygame.Rect(panel.right - 112, panel.y + 24, 82, 34)
+
+    def _weapon_custom_slot_rect(self, index: int) -> pygame.Rect:
+        panel = self._weapon_custom_panel_rect()
+        return pygame.Rect(panel.x + 32 + index * 94, panel.y + 82, 84, 54)
 
     def _weapon_module_rect(self, module_slot: str) -> pygame.Rect:
         order = {"utility": 0, "magazine": 1}
         panel = self._weapon_custom_panel_rect()
-        return pygame.Rect(panel.x + 72 + order.get(module_slot, 0) * 220, panel.y + 266, 178, 82)
+        return pygame.Rect(panel.x + 360 + order.get(module_slot, 0) * 260, panel.y + 168, 236, 126)
+
+    def _weapon_module_return_rect(self) -> pygame.Rect:
+        panel = self._weapon_custom_panel_rect()
+        return pygame.Rect(panel.x + 360, panel.y + 316, 496, 58)
+
+    def _available_module_rect(self, module_key: str) -> pygame.Rect:
+        panel = self._weapon_custom_panel_rect()
+        order = {key: index for index, key in enumerate(WEAPON_MODULES)}
+        index = order.get(module_key, 0)
+        return pygame.Rect(panel.x + 34 + index * 226, panel.y + 414, 210, 96)
 
     def _equipment_rect(self, slot: str) -> pygame.Rect:
         order = {"head": 0, "torso": 1, "arms": 2, "legs": 3}
@@ -1829,6 +1985,11 @@ class GameApp:
             for module_slot in WEAPON_MODULE_SLOTS:
                 if self._weapon_module_rect(module_slot).collidepoint(pos):
                     return {"source": "weapon_module", "slot": weapon_slot, "module_slot": module_slot}
+            if self._weapon_module_return_rect().collidepoint(pos):
+                return {"source": "module_return"}
+            for module_key, indices in self._available_module_groups(player):
+                if indices and self._available_module_rect(module_key).collidepoint(pos):
+                    return {"source": "backpack", "index": indices[0]}
         for index, slot in enumerate(SLOTS):
             if self._quick_rect(index).collidepoint(pos):
                 if player and player.weapons.get(slot):
@@ -1943,6 +2104,26 @@ class GameApp:
         if player:
             return next((slot for slot in SLOTS if player.weapons.get(slot)), "1")
         return "1"
+
+    def _available_module_groups(self, player: PlayerState) -> list[tuple[str, list[int]]]:
+        groups = {key: [] for key in WEAPON_MODULES}
+        for index, item in enumerate(player.backpack):
+            if item and item.key in groups:
+                groups[item.key].append(index)
+        return [(key, groups[key]) for key in WEAPON_MODULES]
+
+    def _module_effect_text(self, module_key: str) -> str:
+        module = WEAPON_MODULES.get(module_key)
+        if not module:
+            return ""
+        if module.key == "laser_module":
+            return f"{self.tr('weaponmods.accuracy')} x{module.spread_multiplier:.2f}"
+        if module.key == "flashlight_module":
+            return f"{int(module.cone_range)} {self.tr('weaponmods.light')}"
+        if module.key == "extended_mag":
+            bonus = int(round((module.magazine_multiplier - 1.0) * 100))
+            return f"+{bonus}% {self.tr('weaponmods.magazine')}"
+        return self.tr(f"weaponmods.slot.{module.slot}")
 
     def _draw_drag_preview(self, player: PlayerState) -> None:
         payload = self._dragged_payload(player)

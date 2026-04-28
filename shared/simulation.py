@@ -737,6 +737,12 @@ class GameWorld:
                 player.quick_items[a], player.quick_items[b] = player.quick_items.get(b), player.quick_items.get(a)
         elif action_type == "repair_drag":
             self._repair_with_kit(player, action)
+        elif action_type == "unequip_module":
+            slot = str(action.get("slot", ""))
+            module_slot = str(action.get("module_slot", ""))
+            item = self._take_item(player, "weapon_module", -1, slot, module_slot)
+            if item and not self._add_item(player, item.key, item.amount, item.rarity):
+                self._place_item(player, "weapon_module", -1, slot, item, module_slot)
         elif action_type == "drop":
             source = str(action.get("source", "backpack"))
             index = int(action.get("index", -1))
