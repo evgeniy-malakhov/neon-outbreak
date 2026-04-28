@@ -118,11 +118,27 @@ class GameApp:
         self.selected_server = 0
         self._last_ping_refresh = 0.0
         self._pinging = False
-        self._menu_buttons = [
-            Button(pygame.Rect(76, 318, 300, 52), "menu.single", "single"),
-            Button(pygame.Rect(76, 382, 300, 52), "menu.online", "online"),
-            Button(pygame.Rect(76, 446, 300, 52), "menu.settings", "options"),
-            Button(pygame.Rect(76, 510, 300, 52), "menu.quit", "quit"),
+        # Create responsive menu buttons with proper centering
+        self._menu_buttons = self._create_menu_buttons()
+
+    def _create_menu_buttons(self) -> list[Button]:
+        """Create menu buttons with responsive positioning"""
+        button_width = 320
+        button_height = 56
+        button_spacing = 20
+        panel_width = 420
+        panel_height = 580
+        panel_x = 48
+        panel_y = (SCREEN_H - panel_height) // 2
+
+        button_x = panel_x + (panel_width - button_width) // 2  # Center buttons in panel
+        start_y = panel_y + 200  # Start below title and subtitle
+
+        return [
+            Button(pygame.Rect(button_x, start_y, button_width, button_height), "menu.single", "single"),
+            Button(pygame.Rect(button_x, start_y + (button_height + button_spacing), button_width, button_height), "menu.online", "online"),
+            Button(pygame.Rect(button_x, start_y + 2 * (button_height + button_spacing), button_width, button_height), "menu.settings", "options"),
+            Button(pygame.Rect(button_x, start_y + 3 * (button_height + button_spacing), button_width, button_height), "menu.quit", "quit"),
         ]
 
     def _load_locales(self) -> dict[str, dict[str, str]]:
@@ -650,12 +666,22 @@ class GameApp:
     def _draw_menu(self) -> None:
         self.screen.fill(BG)
         self._draw_neon_background()
-        panel = pygame.Rect(48, 74, 390, 548)
-        pygame.draw.rect(self.screen, (10, 15, 25), panel, border_radius=10)
-        pygame.draw.rect(self.screen, CYAN, panel, 2, border_radius=10)
-        self._draw_text(self.tr("app.title"), 76, 116, TEXT, self.big)
-        self._draw_text(self.tr("menu.subtitle"), 78, 190, CYAN, self.font)
-        self._draw_text(self.tr("menu.caption"), 78, 222, MUTED, self.small)
+
+        # Create responsive main menu panel
+        panel_width = 420
+        panel_height = 580
+        panel_x = 48
+        panel_y = (SCREEN_H - panel_height) // 2
+        panel = pygame.Rect(panel_x, panel_y, panel_width, panel_height)
+
+        pygame.draw.rect(self.screen, (10, 15, 25), panel, border_radius=12)
+        pygame.draw.rect(self.screen, CYAN, panel, 2, border_radius=12)
+
+        # Improved text positioning
+        self._draw_text_fit(self.tr("app.title"), pygame.Rect(panel.x + 28, panel.y + 32, panel.w - 56, 64), TEXT, self.big, center=True)
+        self._draw_text_fit(self.tr("menu.subtitle"), pygame.Rect(panel.x + 30, panel.y + 110, panel.w - 60, 24), CYAN, self.font, center=True)
+        self._draw_text_fit(self.tr("menu.caption"), pygame.Rect(panel.x + 30, panel.y + 140, panel.w - 60, 20), MUTED, self.small, center=True)
+
         for button in self._menu_buttons:
             self._draw_button(button.rect, self.tr(button.label), button.hovered(pygame.mouse.get_pos()))
         self._draw_menu_showcase()
@@ -1422,28 +1448,37 @@ class GameApp:
             "noise_radius": self.tr("settings.noise_radius"),
         }
         start_y, step_y = self._settings_grid()
+
+        # Calculate centered positioning for settings options
+        option_width = 380
+        option_height = 44
+        option_x = panel.x + (panel.w - option_width) // 2
+
         for index, key in enumerate(self.settings):
-            rect = pygame.Rect(478, start_y + index * step_y, 326, 40)
+            rect = pygame.Rect(option_x, start_y + index * step_y, option_width, option_height)
             pygame.draw.rect(self.screen, PANEL_2, rect, border_radius=8)
             pygame.draw.rect(self.screen, GREEN if self.settings[key] else MUTED, rect, 2, border_radius=8)
             marker = self.tr("state.on") if self.settings[key] else self.tr("state.off")
-            self._draw_text_fit(labels[key], pygame.Rect(rect.x + 14, rect.y + 10, rect.w - 82, 20), TEXT, self.font)
-            self._draw_text(marker, rect.right - 58, rect.y + 10, GREEN if self.settings[key] else RED, self.font)
-        density_rect = pygame.Rect(478, start_y + len(self.settings) * step_y, 326, 40)
+            self._draw_text_fit(labels[key], pygame.Rect(rect.x + 16, rect.y + 12, rect.w - 100, 20), TEXT, self.font)
+            self._draw_text(marker, rect.right - 70, rect.y + 12, GREEN if self.settings[key] else RED, self.font)
+
+        density_rect = pygame.Rect(option_x, start_y + len(self.settings) * step_y, option_width, option_height)
         pygame.draw.rect(self.screen, PANEL_2, density_rect, border_radius=8)
         pygame.draw.rect(self.screen, YELLOW, density_rect, 2, border_radius=8)
-        self._draw_text_fit(self.tr("settings.bot_density"), pygame.Rect(density_rect.x + 14, density_rect.y + 10, density_rect.w - 128, 20), TEXT, self.font)
-        self._draw_text_fit(self.tr(f"density.{self.bot_density}"), pygame.Rect(density_rect.right - 120, density_rect.y + 10, 104, 20), YELLOW, self.font)
-        difficulty_rect = pygame.Rect(478, start_y + (len(self.settings) + 1) * step_y, 326, 40)
+        self._draw_text_fit(self.tr("settings.bot_density"), pygame.Rect(density_rect.x + 16, density_rect.y + 12, density_rect.w - 140, 20), TEXT, self.font)
+        self._draw_text_fit(self.tr(f"density.{self.bot_density}"), pygame.Rect(density_rect.right - 130, density_rect.y + 12, 114, 20), YELLOW, self.font)
+
+        difficulty_rect = pygame.Rect(option_x, start_y + (len(self.settings) + 1) * step_y, option_width, option_height)
         pygame.draw.rect(self.screen, PANEL_2, difficulty_rect, border_radius=8)
         pygame.draw.rect(self.screen, PURPLE, difficulty_rect, 2, border_radius=8)
-        self._draw_text_fit(self.tr("settings.difficulty"), pygame.Rect(difficulty_rect.x + 14, difficulty_rect.y + 10, difficulty_rect.w - 138, 20), TEXT, self.font)
-        self._draw_text_fit(self.tr(f"difficulty.{self.difficulty_key}"), pygame.Rect(difficulty_rect.right - 130, difficulty_rect.y + 10, 114, 20), PURPLE, self.font)
-        language_rect = pygame.Rect(478, start_y + (len(self.settings) + 2) * step_y, 326, 40)
+        self._draw_text_fit(self.tr("settings.difficulty"), pygame.Rect(difficulty_rect.x + 16, difficulty_rect.y + 12, difficulty_rect.w - 150, 20), TEXT, self.font)
+        self._draw_text_fit(self.tr(f"difficulty.{self.difficulty_key}"), pygame.Rect(difficulty_rect.right - 140, difficulty_rect.y + 12, 124, 20), PURPLE, self.font)
+
+        language_rect = pygame.Rect(option_x, start_y + (len(self.settings) + 2) * step_y, option_width, option_height)
         pygame.draw.rect(self.screen, PANEL_2, language_rect, border_radius=8)
         pygame.draw.rect(self.screen, CYAN, language_rect, 2, border_radius=8)
-        self._draw_text_fit(self.tr("settings.language"), pygame.Rect(language_rect.x + 14, language_rect.y + 10, language_rect.w - 78, 20), TEXT, self.font)
-        self._draw_text(self.language.upper(), language_rect.right - 58, language_rect.y + 10, CYAN, self.font)
+        self._draw_text_fit(self.tr("settings.language"), pygame.Rect(language_rect.x + 16, language_rect.y + 12, language_rect.w - 90, 20), TEXT, self.font)
+        self._draw_text(self.language.upper(), language_rect.right - 70, language_rect.y + 12, CYAN, self.font)
         if panel_only:
             self._draw_button(self._settings_back_rect(), self.tr("settings.back"), False)
         else:
@@ -1529,19 +1564,46 @@ class GameApp:
         return action
 
     def _settings_panel_rect(self) -> pygame.Rect:
-        return pygame.Rect(430, 86, 420, 560)
+        # Center the settings panel on screen
+        panel_width = 480
+        panel_height = 580
+        panel_x = (SCREEN_W - panel_width) // 2
+        panel_y = (SCREEN_H - panel_height) // 2
+        return pygame.Rect(panel_x, panel_y, panel_width, panel_height)
 
     def _settings_grid(self) -> tuple[int, int]:
-        return 150, 42
+        panel = self._settings_panel_rect()
+        start_y = panel.y + 120  # Start below title and caption
+        step_y = 48  # Increased spacing for better readability
+        return start_y, step_y
 
     def _settings_back_rect(self) -> pygame.Rect:
-        return pygame.Rect(482, 588, 180, 42)
+        panel = self._settings_panel_rect()
+        button_width = 200
+        button_height = 48
+        button_x = panel.x + (panel.w - button_width) // 2
+        button_y = panel.bottom - button_height - 20
+        return pygame.Rect(button_x, button_y, button_width, button_height)
 
     def _settings_resume_rect(self) -> pygame.Rect:
-        return pygame.Rect(396, 580, 152, 44)
+        panel = self._settings_panel_rect()
+        button_width = 180
+        button_height = 48
+        button_spacing = 20
+        total_width = button_width * 2 + button_spacing
+        start_x = panel.x + (panel.w - total_width) // 2
+        button_y = panel.bottom - button_height - 20
+        return pygame.Rect(start_x, button_y, button_width, button_height)
 
     def _settings_main_menu_rect(self) -> pygame.Rect:
-        return pygame.Rect(566, 580, 190, 44)
+        panel = self._settings_panel_rect()
+        button_width = 180
+        button_height = 48
+        button_spacing = 20
+        total_width = button_width * 2 + button_spacing
+        start_x = panel.x + (panel.w - total_width) // 2
+        button_y = panel.bottom - button_height - 20
+        return pygame.Rect(start_x + button_width + button_spacing, button_y, button_width, button_height)
 
     def _is_dragging(self, source: str, index: int | None = None, slot: str | None = None) -> bool:
         if not self.drag_source or self.drag_source.get("source") != source:
@@ -1712,9 +1774,38 @@ class GameApp:
         return self.tr("item.medicine")
 
     def _draw_button(self, rect: pygame.Rect, label: str, hovered: bool) -> None:
-        pygame.draw.rect(self.screen, PANEL_2 if hovered else PANEL, rect, border_radius=8)
-        pygame.draw.rect(self.screen, CYAN if hovered else (53, 68, 98), rect, 2, border_radius=8)
-        self._draw_text_fit(label, rect.inflate(-20, -8), TEXT, self.mid, center=True)
+        # Create modern button with gradient and shadow effects
+        if hovered:
+            # Draw shadow for hovered state
+            shadow_rect = rect.move(2, 3)
+            shadow_surface = pygame.Surface((shadow_rect.w, shadow_rect.h), pygame.SRCALPHA)
+            pygame.draw.rect(shadow_surface, (0, 0, 0, 60), shadow_surface.get_rect(), border_radius=10)
+            self.screen.blit(shadow_surface, shadow_rect)
+
+            # Draw gradient background for hover
+            gradient_surface = pygame.Surface((rect.w, rect.h), pygame.SRCALPHA)
+            for i in range(rect.h):
+                alpha = 255 - (i * 40 // rect.h)
+                color = (35, 45, 70, alpha)
+                pygame.draw.line(gradient_surface, color, (0, i), (rect.w, i))
+            self.screen.blit(gradient_surface, rect)
+
+            # Draw main button
+            pygame.draw.rect(self.screen, (40, 55, 85), rect, border_radius=10)
+            pygame.draw.rect(self.screen, CYAN, rect, 3, border_radius=10)
+
+            # Add inner glow
+            inner_rect = rect.inflate(-6, -6)
+            pygame.draw.rect(self.screen, (76, 225, 255, 30), inner_rect, 2, border_radius=8)
+        else:
+            # Normal state
+            pygame.draw.rect(self.screen, PANEL, rect, border_radius=10)
+            pygame.draw.rect(self.screen, (53, 68, 98), rect, 2, border_radius=10)
+
+        # Draw text with better positioning
+        text_color = TEXT if hovered else (200, 210, 230)
+        font = self.mid if hovered else self.font
+        self._draw_text_fit(label, rect.inflate(-24, -12), text_color, font, center=True)
 
     def _draw_text(
         self,
