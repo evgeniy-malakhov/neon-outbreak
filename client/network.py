@@ -32,6 +32,7 @@ class OnlineClient:
         self._socket: socket.socket | None = None
         self._reader: Any = None
         self._lock = threading.Lock()
+        self._snapshot_lock = threading.Lock()
         self._running = False
         self._thread: threading.Thread | None = None
         self.error: str | None = None
@@ -47,7 +48,8 @@ class OnlineClient:
             raise ConnectionError(first.get("message", "server refused connection"))
 
         self.player_id = str(first["player_id"])
-        self.latest_snapshot = WorldSnapshot.from_dict(first["snapshot"])
+        with self._snapshot_lock:
+            self.latest_snapshot = WorldSnapshot.from_dict(first["snapshot"])
         self._socket = sock
         self._reader = reader
         self._running = True
@@ -61,6 +63,16 @@ class OnlineClient:
         try:
             with self._lock:
                 self._socket.sendall(encode_message("input", command=command.to_dict()))
+        except OSError as exc:
+            self.error = str(exc)
+            self._running = False
+
+    def send_profile_name(self, name: str) -> None:
+        if not self._socket or not self._running:
+            return
+        try:
+            with self._lock:
+                self._socket.sendall(encode_message("profile", name=name[:18]))
         except OSError as exc:
             self.error = str(exc)
             self._running = False
@@ -79,6 +91,10 @@ class OnlineClient:
         self._socket = None
         self._reader = None
 
+    def snapshot(self) -> WorldSnapshot | None:
+        with self._snapshot_lock:
+            return self.latest_snapshot
+
     def _read_loop(self) -> None:
         try:
             while self._running and self._reader:
@@ -87,11 +103,11 @@ class OnlineClient:
                     break
                 message = decode_message(raw)
                 if message["type"] == "snapshot":
-                    self.latest_snapshot = WorldSnapshot.from_dict(message["snapshot"])
+                    with self._snapshot_lock:
+                        self.latest_snapshot = WorldSnapshot.from_dict(message["snapshot"])
                 elif message["type"] == "error":
                     self.error = str(message.get("message", "server error"))
         except (OSError, ValueError) as exc:
             self.error = str(exc)
         finally:
             self._running = False
-
