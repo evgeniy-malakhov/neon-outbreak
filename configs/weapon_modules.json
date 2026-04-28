@@ -1,0 +1,19 @@
+{
+  "laser_module": {
+    "slot": "utility",
+    "title": "Laser Sight",
+    "beam_length": 760,
+    "spread_multiplier": 0.88
+  },
+  "flashlight_module": {
+    "slot": "utility",
+    "title": "Flashlight",
+    "cone_range": 620,
+    "cone_degrees": 58
+  },
+  "extended_mag": {
+    "slot": "magazine",
+    "title": "Extended Magazine",
+    "magazine_multiplier": 1.16
+  }
+}
