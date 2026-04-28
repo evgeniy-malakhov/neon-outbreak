@@ -75,6 +75,7 @@ class GameApp:
         self._icon_cache: dict[tuple[str, int, int], pygame.Surface] = {}
         self.damage_flash = 0.0
         self._last_local_health: float | None = None
+        self.camera_zoom = 1.0
         self.state = "menu"
         self.player_name = "Operator"
         self.world: GameWorld | None = None
@@ -482,6 +483,7 @@ class GameApp:
                     self.world.set_input(command)
                     self.world.update(0.0)
                     self._clear_transient_inputs()
+                self._update_camera_zoom(dt)
                 self._update_damage_feedback(dt)
                 return
             command = self._build_input(self.local_player_id)
@@ -492,7 +494,18 @@ class GameApp:
             command = self._build_input(self.online.player_id)
             self.online.send_input(command)
             self._clear_transient_inputs()
+        self._update_camera_zoom(dt)
         self._update_damage_feedback(dt)
+
+    def _update_camera_zoom(self, dt: float) -> None:
+        snapshot = self._snapshot()
+        player = self._local_player(snapshot) if snapshot else None
+        target = 0.84 if player and player.alive and player.sprinting else 1.0
+        speed = 3.1 if target < self.camera_zoom else 4.8
+        blend = 1.0 - math.exp(-speed * max(0.0, dt))
+        self.camera_zoom += (target - self.camera_zoom) * blend
+        if abs(self.camera_zoom - target) < 0.002:
+            self.camera_zoom = target
 
     def _update_damage_feedback(self, dt: float) -> None:
         self.damage_flash = max(0.0, self.damage_flash - dt * 1.9)
@@ -655,18 +668,34 @@ class GameApp:
     def _camera(self, player: PlayerState | None) -> Vec2:
         if not player:
             return Vec2(0, 0)
+        viewport_w = SCREEN_W / max(0.1, self.camera_zoom)
+        viewport_h = SCREEN_H / max(0.1, self.camera_zoom)
         return Vec2(
-            max(0, min(MAP_WIDTH - SCREEN_W, player.pos.x - SCREEN_W * 0.5)),
-            max(0, min(MAP_HEIGHT - SCREEN_H, player.pos.y - SCREEN_H * 0.5)),
+            max(0, min(max(0.0, MAP_WIDTH - viewport_w), player.pos.x - viewport_w * 0.5)),
+            max(0, min(max(0.0, MAP_HEIGHT - viewport_h), player.pos.y - viewport_h * 0.5)),
         )
 
     def _mouse_world(self, player: PlayerState | None) -> Vec2:
         mx, my = pygame.mouse.get_pos()
         camera = self._camera(player)
-        return Vec2(mx + camera.x, my + camera.y)
+        zoom = max(0.1, self.camera_zoom)
+        return Vec2(mx / zoom + camera.x, my / zoom + camera.y)
 
     def _world_to_screen(self, pos: Vec2, camera: Vec2) -> tuple[int, int]:
-        return int(pos.x - camera.x), int(pos.y - camera.y)
+        zoom = max(0.1, self.camera_zoom)
+        return int((pos.x - camera.x) * zoom), int((pos.y - camera.y) * zoom)
+
+    def _world_rect_to_screen(self, rect: RectState, camera: Vec2) -> pygame.Rect:
+        zoom = max(0.1, self.camera_zoom)
+        return pygame.Rect(
+            int((rect.x - camera.x) * zoom),
+            int((rect.y - camera.y) * zoom),
+            max(1, int(rect.w * zoom)),
+            max(1, int(rect.h * zoom)),
+        )
+
+    def _world_size(self, value: float, minimum: int = 1) -> int:
+        return max(minimum, int(value * max(0.1, self.camera_zoom)))
 
     def _draw(self) -> None:
         if self.state == "menu":
@@ -797,16 +826,27 @@ class GameApp:
 
     def _draw_world_background(self, camera: Vec2) -> None:
         grid = 80
-        start_x = -int(camera.x) % grid
-        start_y = -int(camera.y) % grid
-        for x in range(start_x, SCREEN_W, grid):
-            pygame.draw.line(self.screen, (18, 25, 41), (x, 0), (x, SCREEN_H))
-        for y in range(start_y, SCREEN_H, grid):
-            pygame.draw.line(self.screen, (18, 25, 41), (0, y), (SCREEN_W, y))
+        zoom = max(0.1, self.camera_zoom)
+        visible_w = SCREEN_W / zoom
+        visible_h = SCREEN_H / zoom
+        start_world_x = math.floor(camera.x / grid) * grid
+        start_world_y = math.floor(camera.y / grid) * grid
+        end_world_x = camera.x + visible_w + grid
+        end_world_y = camera.y + visible_h + grid
+        x = start_world_x
+        while x <= end_world_x:
+            sx = int((x - camera.x) * zoom)
+            pygame.draw.line(self.screen, (18, 25, 41), (sx, 0), (sx, SCREEN_H))
+            x += grid
+        y = start_world_y
+        while y <= end_world_y:
+            sy = int((y - camera.y) * zoom)
+            pygame.draw.line(self.screen, (18, 25, 41), (0, sy), (SCREEN_W, sy))
+            y += grid
         pygame.draw.rect(
             self.screen,
             (34, 55, 76),
-            pygame.Rect(-camera.x, -camera.y, MAP_WIDTH, MAP_HEIGHT),
+            pygame.Rect(int(-camera.x * zoom), int(-camera.y * zoom), int(MAP_WIDTH * zoom), int(MAP_HEIGHT * zoom)),
             3,
         )
 
@@ -814,7 +854,7 @@ class GameApp:
         if not player or player.floor >= 0:
             return
         for tunnel in tunnel_segments(snapshot.buildings):
-            rect = pygame.Rect(int(tunnel.x - camera.x), int(tunnel.y - camera.y), int(tunnel.w), int(tunnel.h))
+            rect = self._world_rect_to_screen(tunnel, camera)
             if not rect.colliderect(pygame.Rect(-120, -120, SCREEN_W + 240, SCREEN_H + 240)):
                 continue
             pygame.draw.rect(self.screen, (10, 14, 20), rect, border_radius=10)
@@ -822,9 +862,8 @@ class GameApp:
 
     def _draw_buildings(self, snapshot: WorldSnapshot, camera: Vec2, player: PlayerState | None) -> None:
         for building in snapshot.buildings.values():
-            bx = int(building.bounds.x - camera.x)
-            by = int(building.bounds.y - camera.y)
-            rect = pygame.Rect(bx, by, int(building.bounds.w), int(building.bounds.h))
+            rect = self._world_rect_to_screen(building.bounds, camera)
+            bx, by = rect.x, rect.y
             if not rect.colliderect(pygame.Rect(-120, -120, SCREEN_W + 240, SCREEN_H + 240)):
                 continue
             player_inside = bool(player and player.inside_building == building.id)
@@ -861,7 +900,7 @@ class GameApp:
         if player.noise <= 0.0 or not player.alive:
             return
         sx, sy = self._world_to_screen(player.pos, camera)
-        radius = int(max(12, min(460, player.noise)))
+        radius = self._world_size(max(12, min(460, player.noise)), 8)
         surface = pygame.Surface((radius * 2 + 8, radius * 2 + 8), pygame.SRCALPHA)
         color = (76, 225, 255, 30) if player.sneaking else (255, 210, 112, 34)
         pygame.draw.circle(surface, color, (radius + 4, radius + 4), radius)
@@ -869,12 +908,7 @@ class GameApp:
         self.screen.blit(surface, (sx - radius - 4, sy - radius - 4))
 
     def _draw_rect_world(self, rect: RectState, camera: Vec2, color: tuple[int, int, int]) -> None:
-        screen_rect = pygame.Rect(
-            int(rect.x - camera.x),
-            int(rect.y - camera.y),
-            max(1, int(rect.w)),
-            max(1, int(rect.h)),
-        )
+        screen_rect = self._world_rect_to_screen(rect, camera)
         pygame.draw.rect(self.screen, color, screen_rect, border_radius=2)
 
     def _draw_loot(self, snapshot: WorldSnapshot, camera: Vec2) -> None:
@@ -916,8 +950,8 @@ class GameApp:
             sx, sy = self._world_to_screen(projectile.pos, camera)
             tail = Vec2(projectile.pos.x - projectile.velocity.x * 0.025, projectile.pos.y - projectile.velocity.y * 0.025)
             tx, ty = self._world_to_screen(tail, camera)
-            pygame.draw.line(self.screen, (255, 244, 170), (tx, ty), (sx, sy), 4)
-            pygame.draw.circle(self.screen, (255, 255, 255), (sx, sy), 3)
+            pygame.draw.line(self.screen, (255, 244, 170), (tx, ty), (sx, sy), self._world_size(4, 2))
+            pygame.draw.circle(self.screen, (255, 255, 255), (sx, sy), self._world_size(3, 2))
 
     def _draw_grenades(self, snapshot: WorldSnapshot, camera: Vec2) -> None:
         player = self._local_player(snapshot)
@@ -935,7 +969,7 @@ class GameApp:
             pygame.draw.circle(self.screen, (255, 255, 255), (sx, sy), max(3, pulse - 5), 1)
             if spec.contact:
                 pygame.draw.circle(self.screen, CYAN, (sx, sy), pulse + 4, 1)
-            pygame.draw.circle(self.screen, YELLOW, (sx, sy), int(spec.blast_radius * progress), 1)
+            pygame.draw.circle(self.screen, YELLOW, (sx, sy), self._world_size(spec.blast_radius * progress, 1), 1)
 
     def _draw_mines(self, snapshot: WorldSnapshot, camera: Vec2) -> None:
         player = self._local_player(snapshot)
@@ -948,7 +982,7 @@ class GameApp:
             base_color = (120, 225, 255) if mine.kind == "mine_light" else RED if mine.kind == "mine_heavy" else YELLOW
             blink = 0.5 + 0.5 * math.sin(snapshot.time * 7.2 + mine.rotation)
             alpha = int((72 if mine.armed else 42) + blink * (70 if mine.armed else 18))
-            self._draw_dashed_circle((sx, sy), int(mine.trigger_radius), base_color, mine.rotation, alpha)
+            self._draw_dashed_circle((sx, sy), self._world_size(mine.trigger_radius, 8), base_color, mine.rotation, alpha)
             glow = pygame.Surface((58, 58), pygame.SRCALPHA)
             pygame.draw.circle(glow, (*base_color, 44 if mine.armed else 24), (29, 29), 28)
             self.screen.blit(glow, (sx - 29, sy - 29))
@@ -990,7 +1024,7 @@ class GameApp:
             if player and pool.floor != player.floor:
                 continue
             sx, sy = self._world_to_screen(pool.pos, camera)
-            radius = int(pool.radius * (0.72 + 0.12 * math.sin(snapshot.time * 6.0 + sx)))
+            radius = self._world_size(pool.radius * (0.72 + 0.12 * math.sin(snapshot.time * 6.0 + sx)), 8)
             pool_surface = pygame.Surface((radius * 2 + 20, radius * 2 + 20), pygame.SRCALPHA)
             center = (pool_surface.get_width() // 2, pool_surface.get_height() // 2)
             pygame.draw.circle(pool_surface, (64, 255, 106, 64), center, radius)
@@ -1000,9 +1034,9 @@ class GameApp:
             if player and spit.floor != player.floor:
                 continue
             sx, sy = self._world_to_screen(spit.pos, camera)
-            pygame.draw.circle(self.screen, (28, 68, 24), (sx, sy), 13)
-            pygame.draw.circle(self.screen, (104, 255, 112), (sx, sy), 8)
-            pygame.draw.circle(self.screen, (220, 255, 180), (sx - 2, sy - 2), 3)
+            pygame.draw.circle(self.screen, (28, 68, 24), (sx, sy), self._world_size(13, 6))
+            pygame.draw.circle(self.screen, (104, 255, 112), (sx, sy), self._world_size(8, 4))
+            pygame.draw.circle(self.screen, (220, 255, 180), (sx - 2, sy - 2), self._world_size(3, 2))
 
     def _draw_zombies(self, snapshot: WorldSnapshot, camera: Vec2) -> None:
         player = self._local_player(snapshot)
@@ -1014,12 +1048,13 @@ class GameApp:
             if -80 <= sx <= SCREEN_W + 80 and -80 <= sy <= SCREEN_H + 80:
                 if self.settings["bot_vision"] and (self.settings["bot_vision_range"] or zombie.mode in {"chase", "investigate", "search"}):
                     cone_len = spec.sight_range if self.settings["bot_vision_range"] else min(spec.sight_range, 160)
+                    cone_len_screen = self._world_size(cone_len, 1)
                     left = zombie.facing - math.radians(spec.fov_degrees * 0.5)
                     right = zombie.facing + math.radians(spec.fov_degrees * 0.5)
                     points = [
                         (sx, sy),
-                        (int(sx + math.cos(left) * cone_len), int(sy + math.sin(left) * cone_len)),
-                        (int(sx + math.cos(right) * cone_len), int(sy + math.sin(right) * cone_len)),
+                        (int(sx + math.cos(left) * cone_len_screen), int(sy + math.sin(left) * cone_len_screen)),
+                        (int(sx + math.cos(right) * cone_len_screen), int(sy + math.sin(right) * cone_len_screen)),
                     ]
                     cone = pygame.Surface((SCREEN_W, SCREEN_H), pygame.SRCALPHA)
                     alpha = 18 if self.settings["bot_vision_range"] else 34
@@ -1027,24 +1062,26 @@ class GameApp:
                     pygame.draw.arc(
                         cone,
                         (*spec.color, 68),
-                        pygame.Rect(sx - cone_len, sy - cone_len, cone_len * 2, cone_len * 2),
+                        pygame.Rect(sx - cone_len_screen, sy - cone_len_screen, cone_len_screen * 2, cone_len_screen * 2),
                         -right,
                         -left,
                         1,
                     )
                     self.screen.blit(cone, (0, 0))
-                pygame.draw.circle(self.screen, (12, 18, 28), (sx, sy), int(spec.radius + 8))
-                pygame.draw.circle(self.screen, spec.color, (sx, sy), int(spec.radius))
-                pygame.draw.circle(self.screen, (255, 255, 255), (sx, sy), int(spec.radius), 2)
-                nose = (int(sx + math.cos(zombie.facing) * (spec.radius + 12)), int(sy + math.sin(zombie.facing) * (spec.radius + 12)))
+                radius = self._world_size(spec.radius, 8)
+                pygame.draw.circle(self.screen, (12, 18, 28), (sx, sy), self._world_size(spec.radius + 8, radius + 4))
+                pygame.draw.circle(self.screen, spec.color, (sx, sy), radius)
+                pygame.draw.circle(self.screen, (255, 255, 255), (sx, sy), radius, 2)
+                nose_len = self._world_size(spec.radius + 12, radius + 4)
+                nose = (int(sx + math.cos(zombie.facing) * nose_len), int(sy + math.sin(zombie.facing) * nose_len))
                 pygame.draw.line(self.screen, TEXT, (sx, sy), nose, 2)
                 if self.settings["health_bars"]:
-                    self._bar(sx - 24, sy - int(spec.radius) - 15, 48, 5, zombie.health / max(1, spec.health), RED)
+                    self._bar(sx - 24, sy - radius - 15, 48, 5, zombie.health / max(1, spec.health), RED)
                 if self.settings["health_bars"] and zombie.armor > 0:
-                    self._bar(sx - 24, sy - int(spec.radius) - 8, 48, 4, zombie.armor / max(1, spec.armor), CYAN)
+                    self._bar(sx - 24, sy - radius - 8, 48, 4, zombie.armor / max(1, spec.armor), CYAN)
                 if self.settings["ai_reactions"]:
                     mode_color = RED if zombie.mode == "chase" else YELLOW if zombie.mode in {"investigate", "search"} else MUTED
-                    self._draw_text(zombie.mode, sx - 22, sy + int(spec.radius) + 8, mode_color, self.small)
+                    self._draw_text(zombie.mode, sx - 22, sy + radius + 8, mode_color, self.small)
 
     def _draw_players(self, snapshot: WorldSnapshot, camera: Vec2) -> None:
         local = self._local_player(snapshot)
@@ -1053,11 +1090,13 @@ class GameApp:
                 continue
             sx, sy = self._world_to_screen(player.pos, camera)
             color = CYAN if player.id == (self.local_player_id or self.online.player_id) else GREEN
-            pygame.draw.circle(self.screen, (4, 8, 14), (sx, sy), 31)
-            pygame.draw.circle(self.screen, color, (sx, sy), 24)
-            pygame.draw.circle(self.screen, TEXT, (sx, sy), 24, 2)
-            muzzle = (int(sx + math.cos(player.angle) * 42), int(sy + math.sin(player.angle) * 42))
-            pygame.draw.line(self.screen, TEXT, (sx, sy), muzzle, 5)
+            body_radius = self._world_size(24, 12)
+            pygame.draw.circle(self.screen, (4, 8, 14), (sx, sy), self._world_size(31, body_radius + 4))
+            pygame.draw.circle(self.screen, color, (sx, sy), body_radius)
+            pygame.draw.circle(self.screen, TEXT, (sx, sy), body_radius, 2)
+            muzzle_len = self._world_size(42, 22)
+            muzzle = (int(sx + math.cos(player.angle) * muzzle_len), int(sy + math.sin(player.angle) * muzzle_len))
+            pygame.draw.line(self.screen, TEXT, (sx, sy), muzzle, self._world_size(5, 2))
             self._draw_text(player.name, sx - 28, sy - 48, TEXT, self.small)
 
     def _draw_weapon_utilities(self, snapshot: WorldSnapshot, camera: Vec2, local: PlayerState | None) -> None:
@@ -1071,19 +1110,19 @@ class GameApp:
             sx, sy = self._world_to_screen(player.pos, camera)
             if utility == "laser_module":
                 module = WEAPON_MODULES.get(utility)
-                length = module.beam_length if module else 720
+                length = self._world_size(module.beam_length if module else 720, 1)
                 end = (int(sx + math.cos(player.angle) * length), int(sy + math.sin(player.angle) * length))
                 laser = pygame.Surface((SCREEN_W, SCREEN_H), pygame.SRCALPHA)
-                pygame.draw.line(laser, (255, 64, 88, 76), (sx, sy), end, 5)
+                pygame.draw.line(laser, (255, 64, 88, 76), (sx, sy), end, self._world_size(5, 2))
                 pygame.draw.line(laser, (255, 210, 220, 138), (sx, sy), end, 1)
-                pygame.draw.circle(laser, (255, 68, 92, 150), end, 4)
+                pygame.draw.circle(laser, (255, 68, 92, 150), end, self._world_size(4, 2))
                 self.screen.blit(laser, (0, 0))
             elif utility == "flashlight_module":
                 self._draw_flashlight_cone(player, camera, soft=True)
 
     def _draw_flashlight_cone(self, player: PlayerState, camera: Vec2, soft: bool) -> None:
         module = WEAPON_MODULES.get("flashlight_module")
-        cone_range = module.cone_range if module else 620
+        cone_range = self._world_size(module.cone_range if module else 620, 1)
         half_angle = math.radians((module.cone_degrees if module else 58) * 0.5)
         sx, sy = self._world_to_screen(player.pos, camera)
         points = [
@@ -1094,7 +1133,7 @@ class GameApp:
         cone = pygame.Surface((SCREEN_W, SCREEN_H), pygame.SRCALPHA)
         color = (255, 238, 168, 38 if soft else 118)
         pygame.draw.polygon(cone, color, points)
-        pygame.draw.circle(cone, (255, 244, 184, 24), (sx, sy), 120)
+        pygame.draw.circle(cone, (255, 244, 184, 24), (sx, sy), self._world_size(120, 24))
         self.screen.blit(cone, (0, 0))
 
     def _draw_tunnel_darkness(self, player: PlayerState, camera: Vec2) -> None:
@@ -1105,7 +1144,7 @@ class GameApp:
         darkness.fill((0, 0, 0, 232 if not has_flashlight else 206))
         if has_flashlight:
             module = WEAPON_MODULES.get("flashlight_module")
-            cone_range = module.cone_range if module else 620
+            cone_range = self._world_size(module.cone_range if module else 620, 1)
             half_angle = math.radians((module.cone_degrees if module else 58) * 0.5)
             sx, sy = self._world_to_screen(player.pos, camera)
             points = [
@@ -1114,7 +1153,7 @@ class GameApp:
                 (int(sx + math.cos(player.angle + half_angle) * cone_range), int(sy + math.sin(player.angle + half_angle) * cone_range)),
             ]
             pygame.draw.polygon(darkness, (0, 0, 0, 58), points)
-            pygame.draw.circle(darkness, (0, 0, 0, 70), (sx, sy), 112)
+            pygame.draw.circle(darkness, (0, 0, 0, 70), (sx, sy), self._world_size(112, 24))
         self.screen.blit(darkness, (0, 0))
         label = self.tr("hud.dark_flashlight" if not has_flashlight else "hud.dark")
         badge = pygame.Rect(SCREEN_W - 288, SCREEN_H - 126, 260, 34)
