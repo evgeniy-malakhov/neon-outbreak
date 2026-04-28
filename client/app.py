@@ -12,6 +12,7 @@ import pygame
 from client.network import OnlineClient, ping_server
 from shared.constants import ARMORS, MAP_HEIGHT, MAP_WIDTH, SLOTS, WEAPONS, ZOMBIES
 from shared.difficulty import DIFFICULTY_KEYS, load_difficulty
+from shared.explosives import GRENADE_SPECS, DEFAULT_GRENADE
 from shared.items import EQUIPMENT_SLOTS, ITEMS, RECIPES
 from shared.level import tunnel_segments
 from shared.models import BuildingState, InputCommand, LootState, PlayerState, RectState, Vec2, WorldSnapshot
@@ -153,7 +154,12 @@ class GameApp:
 
     def _load_item_images(self) -> dict[str, pygame.Surface]:
         aliases = {
+            "contact_grenade": "granade",
             "grenade": "granade",
+            "heavy_grenade": "granade",
+            "mine_light": "gear",
+            "mine_standard": "scrap",
+            "mine_heavy": "ammo_pack",
             "gunpowder": "gun_powder",
             "medicine": "medkit",
             "light": "shield",
@@ -263,6 +269,7 @@ class GameApp:
             self.pending_pickup = True
         elif key == pygame.K_f:
             self.pending_interact = True
+        elif key == pygame.K_q:
             self.pending_toggle_utility = True
         elif key == pygame.K_SPACE:
             self.pending_respawn = True
@@ -746,6 +753,7 @@ class GameApp:
             self._draw_loot(snapshot, camera)
             self._draw_projectiles(snapshot, camera)
             self._draw_grenades(snapshot, camera)
+            self._draw_mines(snapshot, camera)
             self._draw_poison(snapshot, camera)
             self._draw_zombies(snapshot, camera)
             self._draw_players(snapshot, camera)
@@ -899,11 +907,65 @@ class GameApp:
         for grenade in snapshot.grenades.values():
             if player and grenade.floor != player.floor:
                 continue
+            spec = GRENADE_SPECS.get(grenade.kind, DEFAULT_GRENADE)
             sx, sy = self._world_to_screen(grenade.pos, camera)
-            pulse = int(6 + (2.0 - max(0.0, grenade.timer)) * 5)
+            progress = max(0.0, min(1.0, 1.0 - grenade.timer / max(0.05, spec.timer)))
+            pulse = int(7 + progress * 10)
+            color = (103, 236, 190) if grenade.kind == "contact_grenade" else (255, 128, 92) if grenade.kind == "heavy_grenade" else GREEN
+            warning = RED if grenade.timer <= 0.55 else color
             pygame.draw.circle(self.screen, (10, 16, 12), (sx, sy), pulse + 5)
-            pygame.draw.circle(self.screen, GREEN if grenade.timer > 0.6 else RED, (sx, sy), pulse)
-            pygame.draw.circle(self.screen, YELLOW, (sx, sy), int(220 * max(0.0, 1.0 - grenade.timer / 2.0)), 1)
+            pygame.draw.circle(self.screen, warning, (sx, sy), pulse)
+            pygame.draw.circle(self.screen, (255, 255, 255), (sx, sy), max(3, pulse - 5), 1)
+            if spec.contact:
+                pygame.draw.circle(self.screen, CYAN, (sx, sy), pulse + 4, 1)
+            pygame.draw.circle(self.screen, YELLOW, (sx, sy), int(spec.blast_radius * progress), 1)
+
+    def _draw_mines(self, snapshot: WorldSnapshot, camera: Vec2) -> None:
+        player = self._local_player(snapshot)
+        for mine in snapshot.mines.values():
+            if player and mine.floor != player.floor:
+                continue
+            sx, sy = self._world_to_screen(mine.pos, camera)
+            if not (-180 <= sx <= SCREEN_W + 180 and -180 <= sy <= SCREEN_H + 180):
+                continue
+            base_color = (120, 225, 255) if mine.kind == "mine_light" else RED if mine.kind == "mine_heavy" else YELLOW
+            blink = 0.5 + 0.5 * math.sin(snapshot.time * 7.2 + mine.rotation)
+            alpha = int((72 if mine.armed else 42) + blink * (70 if mine.armed else 18))
+            self._draw_dashed_circle((sx, sy), int(mine.trigger_radius), base_color, mine.rotation, alpha)
+            glow = pygame.Surface((58, 58), pygame.SRCALPHA)
+            pygame.draw.circle(glow, (*base_color, 44 if mine.armed else 24), (29, 29), 28)
+            self.screen.blit(glow, (sx - 29, sy - 29))
+            pygame.draw.circle(self.screen, (8, 11, 16), (sx, sy), 18)
+            pygame.draw.circle(self.screen, base_color if mine.armed else MUTED, (sx, sy), 13)
+            pygame.draw.circle(self.screen, TEXT, (sx, sy), 13, 1)
+            if mine.armed and blink > 0.55:
+                pygame.draw.circle(self.screen, RED, (sx, sy), 5)
+            if not self._draw_item_icon(mine.kind, pygame.Rect(sx - 12, sy - 12, 24, 24)):
+                pygame.draw.line(self.screen, BG, (sx - 8, sy), (sx + 8, sy), 2)
+                pygame.draw.line(self.screen, BG, (sx, sy - 8), (sx, sy + 8), 2)
+
+    def _draw_dashed_circle(
+        self,
+        center: tuple[int, int],
+        radius: int,
+        color: tuple[int, int, int],
+        phase: float,
+        alpha: int,
+    ) -> None:
+        if radius <= 0:
+            return
+        surface = pygame.Surface((radius * 2 + 16, radius * 2 + 16), pygame.SRCALPHA)
+        local_center = (radius + 8, radius + 8)
+        segments = 40
+        for index in range(segments):
+            if index % 2:
+                continue
+            a1 = phase + math.tau * index / segments
+            a2 = phase + math.tau * (index + 0.62) / segments
+            p1 = (int(local_center[0] + math.cos(a1) * radius), int(local_center[1] + math.sin(a1) * radius))
+            p2 = (int(local_center[0] + math.cos(a2) * radius), int(local_center[1] + math.sin(a2) * radius))
+            pygame.draw.line(surface, (*color, alpha), p1, p2, 2)
+        self.screen.blit(surface, (center[0] - radius - 8, center[1] - radius - 8))
 
     def _draw_poison(self, snapshot: WorldSnapshot, camera: Vec2) -> None:
         player = self._local_player(snapshot)
@@ -1132,6 +1194,7 @@ class GameApp:
         pygame.draw.rect(self.screen, YELLOW if player.sprinting else GREEN, pygame.Rect(62, 134, noise_w, 5), border_radius=2)
 
         weapon = player.active_weapon()
+        active_quick_item = player.quick_items.get(player.active_slot)
         weapon_title = self.tr("hud.unarmed")
         ammo = "--"
         reload_text = ""
@@ -1141,6 +1204,9 @@ class GameApp:
             ammo = f"{weapon.ammo_in_mag}/{weapon.reserve_ammo}"
             if weapon.reload_left > 0:
                 reload_text = f" {self.tr('hud.reloading')} {weapon.reload_left:.1f}s"
+        elif active_quick_item:
+            weapon_title = self.item_title(active_quick_item.key)
+            ammo = f"x{active_quick_item.amount}"
         pygame.draw.circle(self.screen, YELLOW, (398, 44), 10)
         self._draw_text(f"{weapon_title}  {ammo}{reload_text}", 426, 32, TEXT, self.mid)
 
@@ -1160,7 +1226,7 @@ class GameApp:
             elif quick_item:
                 label = f"{slot} {self.item_title(quick_item.key).split()[0]}"
                 self._draw_item_icon(quick_item.key, pygame.Rect(rect.x + 22, rect.y + 6, 28, 28))
-            self._draw_text(label, rect.x + 8, rect.y + 15, TEXT if weapon or quick_item else MUTED, self.small)
+            self._draw_text_fit(label, rect.inflate(-10, -12), TEXT if weapon or quick_item else MUTED, self.small, center=True)
 
     def _draw_minimap(self, snapshot: WorldSnapshot, player: PlayerState | None) -> None:
         size = 226 if self.minimap_big else 156
@@ -1175,6 +1241,10 @@ class GameApp:
             if player and item.floor != player.floor:
                 continue
             pygame.draw.circle(self.screen, YELLOW, mp(item.pos), 2)
+        for mine in snapshot.mines.values():
+            if player and mine.floor != player.floor:
+                continue
+            pygame.draw.circle(self.screen, RED if mine.armed else YELLOW, mp(mine.pos), 3)
         for zombie in snapshot.zombies.values():
             if player and zombie.floor != player.floor:
                 continue

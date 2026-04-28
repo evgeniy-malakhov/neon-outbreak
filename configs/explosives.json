@@ -1,0 +1,66 @@
+{
+  "grenades": {
+    "contact_grenade": {
+      "title": "Impact Grenade",
+      "timer": 4.0,
+      "contact": true,
+      "throw_distance": 650.0,
+      "blast_radius": 190.0,
+      "zombie_damage": 95,
+      "zombie_damage_bonus": 24,
+      "player_damage": 35,
+      "player_damage_bonus": 7
+    },
+    "grenade": {
+      "title": "Fragmentation Grenade",
+      "timer": 2.0,
+      "contact": false,
+      "throw_distance": 420.0,
+      "blast_radius": 220.0,
+      "zombie_damage": 115,
+      "zombie_damage_bonus": 28,
+      "player_damage": 42,
+      "player_damage_bonus": 8
+    },
+    "heavy_grenade": {
+      "title": "Heavy Grenade",
+      "timer": 3.0,
+      "contact": false,
+      "throw_distance": 340.0,
+      "blast_radius": 440.0,
+      "zombie_damage": 230,
+      "zombie_damage_bonus": 56,
+      "player_damage": 84,
+      "player_damage_bonus": 16
+    }
+  },
+  "mines": {
+    "mine_light": {
+      "title": "Light Mine",
+      "trigger_radius": 86.0,
+      "blast_radius": 170.0,
+      "zombie_damage": 80,
+      "zombie_damage_bonus": 20,
+      "player_damage": 32,
+      "player_damage_bonus": 8
+    },
+    "mine_standard": {
+      "title": "Field Mine",
+      "trigger_radius": 104.0,
+      "blast_radius": 230.0,
+      "zombie_damage": 125,
+      "zombie_damage_bonus": 32,
+      "player_damage": 48,
+      "player_damage_bonus": 12
+    },
+    "mine_heavy": {
+      "title": "Heavy Mine",
+      "trigger_radius": 122.0,
+      "blast_radius": 310.0,
+      "zombie_damage": 190,
+      "zombie_damage_bonus": 46,
+      "player_damage": 72,
+      "player_damage_bonus": 18
+    }
+  }
+}

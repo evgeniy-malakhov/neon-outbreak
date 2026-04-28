@@ -24,7 +24,9 @@ from shared.constants import (
     ZOMBIE_TARGET_RADIUS,
     ZOMBIES,
 )
+from shared.backpack_config import BackpackConfig, load_backpack_config
 from shared.difficulty import DifficultyConfig, load_difficulty
+from shared.explosives import GRENADE_SPECS, MINE_SPECS, DEFAULT_GRENADE, DEFAULT_MINE
 from shared.items import ITEMS, LEGACY_LOOT_TO_ITEM, RECIPES, WORLD_LOOT, HOUSE_LOOT
 from shared.level import all_closed_walls, make_buildings, nearest_door, nearest_prop, nearest_stairs, point_building
 from shared.weapon_modules import WEAPON_MODULES
@@ -34,6 +36,7 @@ from shared.models import (
     InputCommand,
     InventoryItem,
     LootState,
+    MineState,
     PlayerState,
     PoisonPoolState,
     PoisonProjectileState,
@@ -57,12 +60,14 @@ class GameWorld:
         self.rng = random.Random(seed)
         self.time = 0.0
         self.difficulty: DifficultyConfig = load_difficulty(difficulty_key)
+        self.backpack_config: BackpackConfig = load_backpack_config()
         self.initial_zombies = self.difficulty.initial_zombies if initial_zombies is None else initial_zombies
         self.max_zombies = self.difficulty.max_zombies if max_zombies is None else max_zombies
         self.players: dict[str, PlayerState] = {}
         self.zombies: dict[str, ZombieState] = {}
         self.projectiles: dict[str, ProjectileState] = {}
         self.grenades: dict[str, GrenadeState] = {}
+        self.mines: dict[str, MineState] = {}
         self.poison_projectiles: dict[str, PoisonProjectileState] = {}
         self.poison_pools: dict[str, PoisonPoolState] = {}
         self.loot: dict[str, LootState] = {}
@@ -108,13 +113,20 @@ class GameWorld:
             name=name[:18] or "Player",
             pos=self._random_open_pos(centered=True),
             kills_by_kind={kind: 0 for kind in ZOMBIES},
+            backpack=[None] * self.backpack_config.slots,
         )
-        pistol = WEAPONS["pistol"]
-        player.weapons[pistol.slot] = WeaponRuntime("pistol", pistol.magazine_size, 48)
+        weapon_key = self.backpack_config.starting_weapon.key
+        if weapon_key not in WEAPONS:
+            weapon_key = "pistol"
+        weapon_spec = WEAPONS[weapon_key]
+        player.weapons[weapon_spec.slot] = WeaponRuntime(
+            weapon_key,
+            weapon_spec.magazine_size,
+            self.backpack_config.starting_weapon.reserve_ammo,
+        )
         player.quick_items = {slot: None for slot in SLOTS}
-        self._add_item(player, "apple", 2)
-        self._add_item(player, "bandage", 1)
-        self._add_item(player, "cloth", 2)
+        for item in self.backpack_config.starting_items:
+            self._add_item(player, item.key, item.amount)
         self.players[player_id] = player
         self.inputs[player_id] = InputCommand(player_id=player_id, aim_x=player.pos.x + 1, aim_y=player.pos.y)
         self._grenade_cooldowns[player_id] = 0.0
@@ -134,6 +146,7 @@ class GameWorld:
         self._update_players(dt)
         self._update_projectiles(dt)
         self._update_grenades(dt)
+        self._update_mines(dt)
         self._update_poison_projectiles(dt)
         self._update_poison_pools(dt)
         self._update_poisoned_players(dt)
@@ -174,7 +187,7 @@ class GameWorld:
                     self.respawn_player(player.id)
                 continue
 
-            if command.active_slot and command.active_slot in player.weapons:
+            if command.active_slot and command.active_slot in SLOTS:
                 player.active_slot = command.active_slot
             if command.equip_armor and command.equip_armor in ARMORS:
                 self._equip_armor(player, command.equip_armor)
@@ -260,18 +273,72 @@ class GameWorld:
     def _update_grenades(self, dt: float) -> None:
         detonated: list[str] = []
         for grenade in self.grenades.values():
+            spec = GRENADE_SPECS.get(grenade.kind, DEFAULT_GRENADE)
             grenade.timer -= dt
             grenade.velocity = grenade.velocity.scaled(0.92)
             grenade.pos.add(grenade.velocity.scaled(dt))
-            if self._blocked_at(grenade.pos, grenade.radius, grenade.floor):
+            hit_wall = self._blocked_at(grenade.pos, grenade.radius, grenade.floor)
+            if hit_wall:
                 grenade.velocity = grenade.velocity.scaled(-0.22)
                 grenade.pos.add(grenade.velocity.scaled(dt))
-            if grenade.timer <= 0.0:
+            if grenade.timer <= 0.0 or (spec.contact and (hit_wall or self._grenade_touched_actor(grenade))):
                 detonated.append(grenade.id)
         for grenade_id in detonated:
             grenade = self.grenades.pop(grenade_id, None)
             if grenade:
                 self._detonate_grenade(grenade)
+
+    def _grenade_touched_actor(self, grenade: GrenadeState) -> bool:
+        for zombie in self.zombies.values():
+            if zombie.floor != grenade.floor:
+                continue
+            spec = ZOMBIES[zombie.kind]
+            if grenade.pos.distance_to(zombie.pos) <= spec.radius + grenade.radius:
+                return True
+        for player in self.players.values():
+            if player.alive and player.floor == grenade.floor and grenade.pos.distance_to(player.pos) <= PLAYER_RADIUS + grenade.radius:
+                return True
+        return False
+
+    def _update_mines(self, dt: float) -> None:
+        detonated: list[str] = []
+        for mine in self.mines.values():
+            mine.rotation = (mine.rotation + dt * (1.6 if mine.armed else 0.55)) % math.tau
+            if not mine.armed:
+                owner = self.players.get(mine.owner_id)
+                if (
+                    not owner
+                    or not owner.alive
+                    or owner.floor != mine.floor
+                    or owner.pos.distance_to(mine.pos) > mine.trigger_radius + PLAYER_RADIUS
+                ):
+                    mine.armed = True
+                continue
+            if self._mine_has_trigger(mine):
+                detonated.append(mine.id)
+        for mine_id in detonated:
+            mine = self.mines.pop(mine_id, None)
+            if mine:
+                self._detonate_mine(mine)
+
+    def _mine_has_trigger(self, mine: MineState) -> bool:
+        for zombie in self.zombies.values():
+            if zombie.floor != mine.floor:
+                continue
+            if (
+                zombie.pos.distance_to(mine.pos) <= mine.trigger_radius + ZOMBIES[zombie.kind].radius * 0.35
+                and not self._line_blocked(mine.pos, zombie.pos, mine.floor)
+            ):
+                return True
+        for player in self.players.values():
+            if not player.alive or player.floor != mine.floor:
+                continue
+            if (
+                player.pos.distance_to(mine.pos) <= mine.trigger_radius + PLAYER_RADIUS * 0.25
+                and not self._line_blocked(mine.pos, player.pos, mine.floor)
+            ):
+                return True
+        return False
 
     def _update_poison_projectiles(self, dt: float) -> None:
         expired: list[str] = []
@@ -728,7 +795,7 @@ class GameWorld:
             return displaced
         if destination == "quick_item" and slot in SLOTS:
             spec = ITEMS.get(item.key)
-            if not spec or spec.kind != "grenade":
+            if not spec or spec.kind not in {"grenade", "mine"}:
                 return item
             displaced = player.quick_items.get(slot)
             player.quick_items[slot] = item
@@ -912,9 +979,14 @@ class GameWorld:
 
     def _shoot(self, player: PlayerState) -> None:
         quick_item = player.quick_items.get(player.active_slot)
-        if quick_item and quick_item.key == "grenade":
-            self._throw_grenade_from_quick(player, player.active_slot)
-            return
+        if quick_item:
+            spec = ITEMS.get(quick_item.key)
+            if spec and spec.kind == "grenade":
+                self._throw_grenade_from_quick(player, player.active_slot)
+                return
+            if spec and spec.kind == "mine":
+                self._place_mine_from_quick(player, player.active_slot)
+                return
         weapon = player.active_weapon()
         if not weapon:
             return
@@ -959,51 +1031,131 @@ class GameWorld:
         if self._grenade_cooldowns.get(player.id, 0.0) > 0:
             return
         quick_item = player.quick_items.get(player.active_slot)
-        if quick_item and quick_item.key == "grenade":
+        if quick_item and ITEMS.get(quick_item.key) and ITEMS[quick_item.key].kind == "grenade":
             self._throw_grenade_from_quick(player, player.active_slot)
             return
-        if not self._remove_items(player, "grenade", 1):
-            return
-        self._spawn_grenade(player)
+        for grenade_key in ("grenade", "contact_grenade", "heavy_grenade"):
+            if self._remove_items(player, grenade_key, 1):
+                self._spawn_grenade(player, grenade_key)
+                return
 
     def _throw_grenade_from_quick(self, player: PlayerState, slot: str) -> None:
         if self._grenade_cooldowns.get(player.id, 0.0) > 0:
             return
         item = player.quick_items.get(slot)
-        if not item or item.key != "grenade":
+        spec = ITEMS.get(item.key) if item else None
+        if not item or not spec or spec.kind != "grenade":
             return
+        grenade_key = item.key
         item.amount -= 1
         if item.amount <= 0:
             player.quick_items[slot] = None
-        self._spawn_grenade(player)
+        self._spawn_grenade(player, grenade_key)
         self._grenade_cooldowns[player.id] = 0.6
 
-    def _spawn_grenade(self, player: PlayerState) -> None:
+    def _spawn_grenade(self, player: PlayerState, grenade_key: str = "grenade") -> None:
+        grenade_spec = GRENADE_SPECS.get(grenade_key, DEFAULT_GRENADE)
         self._grenade_cooldowns[player.id] = 0.6
-        distance = 420.0
+        distance = grenade_spec.throw_distance
         velocity = Vec2(math.cos(player.angle) * distance, math.sin(player.angle) * distance)
         start = Vec2(
             player.pos.x + math.cos(player.angle) * (PLAYER_RADIUS + 12),
             player.pos.y + math.sin(player.angle) * (PLAYER_RADIUS + 12),
         )
         grenade_id = self._id("g")
-        self.grenades[grenade_id] = GrenadeState(grenade_id, player.id, start, velocity, timer=2.0, floor=player.floor)
+        self.grenades[grenade_id] = GrenadeState(
+            grenade_id,
+            player.id,
+            start,
+            velocity,
+            timer=grenade_spec.timer,
+            floor=player.floor,
+            kind=grenade_key,
+        )
 
     def _detonate_grenade(self, grenade: GrenadeState) -> None:
-        blast_radius = 220.0
+        spec = GRENADE_SPECS.get(grenade.kind, DEFAULT_GRENADE)
+        self._explode_at(
+            grenade.pos,
+            grenade.floor,
+            grenade.owner_id,
+            spec.blast_radius,
+            spec.zombie_damage,
+            spec.zombie_damage_bonus,
+            spec.player_damage,
+            spec.player_damage_bonus,
+        )
+
+    def _place_mine_from_quick(self, player: PlayerState, slot: str) -> None:
+        if self._grenade_cooldowns.get(player.id, 0.0) > 0:
+            return
+        item = player.quick_items.get(slot)
+        spec = ITEMS.get(item.key) if item else None
+        if not item or not spec or spec.kind != "mine":
+            return
+        mine_spec = MINE_SPECS.get(item.key, DEFAULT_MINE)
+        place_pos = Vec2(
+            player.pos.x + math.cos(player.angle) * (PLAYER_RADIUS + 20),
+            player.pos.y + math.sin(player.angle) * (PLAYER_RADIUS + 20),
+        )
+        place_pos.clamp_to_map(MAP_WIDTH, MAP_HEIGHT)
+        if self._blocked_at(place_pos, 12, player.floor):
+            place_pos = player.pos.copy()
+        mine_id = self._id("m")
+        self.mines[mine_id] = MineState(
+            id=mine_id,
+            owner_id=player.id,
+            kind=item.key,
+            pos=place_pos,
+            floor=player.floor,
+            armed=False,
+            trigger_radius=mine_spec.trigger_radius,
+            blast_radius=mine_spec.blast_radius,
+        )
+        item.amount -= 1
+        if item.amount <= 0:
+            player.quick_items[slot] = None
+        self._grenade_cooldowns[player.id] = 0.45
+
+    def _detonate_mine(self, mine: MineState) -> None:
+        spec = MINE_SPECS.get(mine.kind, DEFAULT_MINE)
+        self._explode_at(
+            mine.pos,
+            mine.floor,
+            mine.owner_id,
+            spec.blast_radius,
+            spec.zombie_damage,
+            spec.zombie_damage_bonus,
+            spec.player_damage,
+            spec.player_damage_bonus,
+        )
+
+    def _explode_at(
+        self,
+        pos: Vec2,
+        floor: int,
+        owner_id: str,
+        blast_radius: float,
+        zombie_damage: int,
+        zombie_damage_bonus: int,
+        player_damage: int,
+        player_damage_bonus: int,
+    ) -> None:
         for zombie in list(self.zombies.values()):
-            if zombie.floor != grenade.floor:
+            if zombie.floor != floor:
                 continue
-            distance = zombie.pos.distance_to(grenade.pos)
-            if distance <= blast_radius and not self._line_blocked(grenade.pos, zombie.pos, grenade.floor):
-                damage = int(115 * (1.0 - distance / blast_radius)) + 28
-                self._damage_zombie(zombie, damage, grenade.owner_id)
+            distance = zombie.pos.distance_to(pos)
+            if distance <= blast_radius and not self._line_blocked(pos, zombie.pos, floor):
+                damage = int(zombie_damage * (1.0 - distance / blast_radius)) + zombie_damage_bonus
+                self._damage_zombie(zombie, damage, owner_id)
         for player in self.players.values():
-            if player.floor != grenade.floor or not player.alive:
+            if player.floor != floor or not player.alive:
                 continue
-            distance = player.pos.distance_to(grenade.pos)
-            if distance <= blast_radius * 0.65 and not self._line_blocked(grenade.pos, player.pos, grenade.floor):
-                self._damage_player(player, int(42 * (1.0 - distance / (blast_radius * 0.65))) + 8)
+            player_radius = blast_radius * 0.65
+            distance = player.pos.distance_to(pos)
+            if distance <= player_radius and not self._line_blocked(pos, player.pos, floor):
+                damage = int(player_damage * (1.0 - distance / player_radius)) + player_damage_bonus
+                self._damage_player(player, damage)
 
     def _pickup_nearby(self, player: PlayerState) -> None:
         closest = None
@@ -1247,6 +1399,7 @@ class GameWorld:
             zombies=dict(self.zombies),
             projectiles=dict(self.projectiles),
             grenades=dict(self.grenades),
+            mines=dict(self.mines),
             poison_projectiles=dict(self.poison_projectiles),
             poison_pools=dict(self.poison_pools),
             loot=dict(self.loot),

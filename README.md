@@ -17,7 +17,7 @@ Top-down shooter prototype in Python with a shared simulation core for single-pl
 - Multi-floor interiors with basements, work benches, repair tables and floor-specific visibility.
 - Basement tunnel network connecting buildings. Tunnels are dark; flashlight modules reveal loot and navigation.
 - Grid backpack with body armor slots, drag/drop, item dropping, consumables, resources, crafting and armor repair.
-- Quick slots can hold weapons or grenades; weapons can be reordered by dragging them between slots.
+- Quick slots can hold weapons, grenades or mines; weapons can be reordered by dragging them between slots.
 - Weapon customization supports utility and magazine module slots. Laser sights tighten aim, flashlights light tunnels, and extended magazines increase capacity.
 - Weapons and equipped armor have durability. Drag a repair kit onto a damaged item to repair it.
 - Online scoreboard with per-player kills by zombie type and online respawn.
@@ -82,9 +82,11 @@ Server difficulty can be `easy`, `medium`, `hard` or `insane`. In online mode th
 - `Ctrl`: sneak. Sneaking is slower and silent.
 - `R`: reload.
 - `E`: pick up loot nearby.
-- `F`: open/close nearby doors or use stairs inside buildings; otherwise toggles the active weapon utility module.
-- `G`: throw a grenade. It detonates after 2 seconds.
-- `1`-`9`, `0`: select weapon or quick-slot grenade.
+- `F`: open/close nearby doors or use stairs inside buildings.
+- `Q`: toggle the active weapon utility module, such as laser or flashlight.
+- `G`: throw a grenade from the backpack. Impact grenades explode on contact, standard grenades detonate after 2 seconds, and heavy grenades detonate after 3 seconds.
+- `1`-`9`, `0`: select weapon or quick-slot grenade/mine.
+- `Left mouse` with a selected mine: place it on the field. It arms after you leave its trigger radius.
 - `B`: backpack.
 - `C`: crafting menu near a basement work bench.
 - `O` or `Esc` in game: visual settings. Online mode keeps running; single-player pauses while overlays are open.
@@ -114,6 +116,8 @@ Work benches are in basements and open the crafting menu with `C`. Repair tables
 Light armor can be found in the world. Medium and heavy armor pieces are crafted for each body slot. Drag a repair kit directly onto damaged weapons or equipment to consume the kit and restore durability.
 
 Open the backpack and press `Customize Weapon` to install modules. Utility slots accept a laser sight or flashlight; magazine slots accept an extended magazine. While weapon customization is open, close it before switching to crafting or closing the backpack.
+
+Explosive balance is configured in `configs/explosives.json`. Starting backpack contents are configured in `configs/backpack.json`, and item stack sizes are configured in `configs/item_stacks.json`.
 
 ## Localization
 

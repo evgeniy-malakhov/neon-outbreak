@@ -507,6 +507,7 @@ class GrenadeState:
     timer: float
     floor: int = 0
     radius: float = 10.0
+    kind: str = "grenade"
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -517,6 +518,7 @@ class GrenadeState:
             "timer": round(self.timer, 3),
             "floor": self.floor,
             "radius": self.radius,
+            "kind": self.kind,
         }
 
     @classmethod
@@ -529,6 +531,47 @@ class GrenadeState:
             timer=float(data.get("timer", 0.0)),
             floor=int(data.get("floor", 0)),
             radius=float(data.get("radius", 10.0)),
+            kind=str(data.get("kind", "grenade")),
+        )
+
+
+@dataclass(slots=True)
+class MineState:
+    id: str
+    owner_id: str
+    kind: str
+    pos: Vec2
+    floor: int = 0
+    armed: bool = False
+    trigger_radius: float = 100.0
+    blast_radius: float = 220.0
+    rotation: float = 0.0
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "id": self.id,
+            "owner_id": self.owner_id,
+            "kind": self.kind,
+            "pos": self.pos.to_dict(),
+            "floor": self.floor,
+            "armed": self.armed,
+            "trigger_radius": self.trigger_radius,
+            "blast_radius": self.blast_radius,
+            "rotation": round(self.rotation, 3),
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "MineState":
+        return cls(
+            id=str(data["id"]),
+            owner_id=str(data.get("owner_id", "")),
+            kind=str(data.get("kind", "mine_standard")),
+            pos=Vec2.from_dict(data.get("pos", {})),
+            floor=int(data.get("floor", 0)),
+            armed=bool(data.get("armed", False)),
+            trigger_radius=float(data.get("trigger_radius", 100.0)),
+            blast_radius=float(data.get("blast_radius", 220.0)),
+            rotation=float(data.get("rotation", 0.0)),
         )
 
 
@@ -711,6 +754,7 @@ class WorldSnapshot:
     projectiles: dict[str, ProjectileState]
     loot: dict[str, LootState]
     grenades: dict[str, GrenadeState] = field(default_factory=dict)
+    mines: dict[str, MineState] = field(default_factory=dict)
     poison_projectiles: dict[str, PoisonProjectileState] = field(default_factory=dict)
     poison_pools: dict[str, PoisonPoolState] = field(default_factory=dict)
     buildings: dict[str, BuildingState] = field(default_factory=dict)
@@ -724,6 +768,7 @@ class WorldSnapshot:
             "zombies": {key: value.to_dict() for key, value in self.zombies.items()},
             "projectiles": {key: value.to_dict() for key, value in self.projectiles.items()},
             "grenades": {key: value.to_dict() for key, value in self.grenades.items()},
+            "mines": {key: value.to_dict() for key, value in self.mines.items()},
             "poison_projectiles": {key: value.to_dict() for key, value in self.poison_projectiles.items()},
             "poison_pools": {key: value.to_dict() for key, value in self.poison_pools.items()},
             "loot": {key: value.to_dict() for key, value in self.loot.items()},
@@ -740,6 +785,7 @@ class WorldSnapshot:
             zombies={key: ZombieState.from_dict(value) for key, value in data.get("zombies", {}).items()},
             projectiles={key: ProjectileState.from_dict(value) for key, value in data.get("projectiles", {}).items()},
             grenades={key: GrenadeState.from_dict(value) for key, value in data.get("grenades", {}).items()},
+            mines={key: MineState.from_dict(value) for key, value in data.get("mines", {}).items()},
             poison_projectiles={
                 key: PoisonProjectileState.from_dict(value)
                 for key, value in data.get("poison_projectiles", {}).items()
