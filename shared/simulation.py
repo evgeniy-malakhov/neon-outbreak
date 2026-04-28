@@ -4,6 +4,7 @@ import math
 import os
 import random
 import threading
+from heapq import heappop, heappush
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
 
@@ -68,6 +69,12 @@ class _ZombieUpdateResult:
     zombie: ZombieState
     player_hits: list[tuple[str, int]]
     poison_spits: list[_PoisonSpitEvent]
+
+
+EXPLOSION_NOISE_RADIUS = 1250.0
+NAVIGATION_MARGIN = 34.0
+NAVIGATION_CORRIDOR_PADDING = 560.0
+NAVIGATION_MAX_NODES = 56
 
 
 class GameWorld:
@@ -600,15 +607,21 @@ class GameWorld:
             self._try_zombie_attack(zombie, target, player_hits)
             return
         if target and target.inside_building:
-            entry = self._building_entry_target(target.inside_building)
-            if entry and target.floor == zombie.floor:
-                zombie.last_known_pos = entry
+            if target.floor == zombie.floor:
+                entry = self._building_entry_target(target.inside_building)
+                if entry:
+                    zombie.last_known_pos = entry
+                if zombie.inside_building == target.inside_building:
+                    zombie.last_known_pos = target.pos.copy()
             elif target.floor != zombie.floor:
                 zombie.mode = "search"
                 zombie.search_timer = SEARCH_DURATION
         if zombie.last_known_pos:
             if zombie.pos.distance_to(zombie.last_known_pos) > 28:
-                self._zombie_move_toward(zombie, zombie.last_known_pos, dt, sprint=True, rng=rng)
+                moved = self._zombie_move_toward(zombie, zombie.last_known_pos, dt, sprint=True, rng=rng)
+                if not moved and target and target.inside_building:
+                    zombie.mode = "search"
+                    zombie.search_timer = min(SEARCH_DURATION, max(1.8, zombie.search_timer))
             else:
                 zombie.mode = "search"
                 zombie.search_timer = SEARCH_DURATION
@@ -628,10 +641,15 @@ class GameWorld:
         target = self._find_player(players, zombie.target_player_id)
         if target and target.inside_building:
             entry = self._building_entry_target(target.inside_building)
-            if entry:
+            if target.inside_building == zombie.inside_building:
+                zombie.last_known_pos = target.pos.copy()
+            elif entry:
                 zombie.last_known_pos = entry
         if zombie.pos.distance_to(zombie.last_known_pos) > 34:
-            self._zombie_move_toward(zombie, zombie.last_known_pos, dt, sprint=False, rng=rng)
+            moved = self._zombie_move_toward(zombie, zombie.last_known_pos, dt, sprint=True, rng=rng)
+            if not moved:
+                zombie.mode = "search"
+                zombie.search_timer = min(SEARCH_DURATION, max(1.8, zombie.search_timer))
         else:
             zombie.mode = "search"
             zombie.search_timer = SEARCH_DURATION
@@ -651,7 +669,7 @@ class GameWorld:
             distance = rng.uniform(80, 220)
             zombie.waypoint = Vec2(base.x + math.cos(angle) * distance, base.y + math.sin(angle) * distance)
             zombie.waypoint.clamp_to_map(MAP_WIDTH, MAP_HEIGHT)
-        self._zombie_move_toward(zombie, zombie.waypoint, dt, sprint=False, rng=rng)
+        self._zombie_move_toward(zombie, zombie.waypoint, dt, sprint=bool(zombie.inside_building), rng=rng)
 
     def _update_patrol(self, zombie: ZombieState, dt: float, rng: random.Random) -> None:
         if zombie.idle_timer > 0.0:
@@ -666,7 +684,7 @@ class GameWorld:
                 zombie.waypoint = None
                 return
             zombie.waypoint = self._random_patrol_pos(rng)
-        self._zombie_move_toward(zombie, zombie.waypoint, dt, sprint=False, rng=rng)
+        self._zombie_move_toward(zombie, zombie.waypoint, dt, sprint=False, rng=rng, patrol=True)
 
     def _zombie_move_toward(
         self,
@@ -675,29 +693,53 @@ class GameWorld:
         dt: float,
         sprint: bool,
         rng: random.Random | None = None,
-    ) -> None:
+        patrol: bool = False,
+    ) -> bool:
         rng = rng or self.rng
         spec = ZOMBIES[zombie.kind]
-        direction = Vec2(target.x - zombie.pos.x, target.y - zombie.pos.y)
+        move_target = target if patrol else self._navigation_target(zombie.pos, target, zombie.floor, spec.radius, rng)
+        direction = Vec2(move_target.x - zombie.pos.x, move_target.y - zombie.pos.y)
         if direction.length() <= 0.01:
-            return
+            return False
         zombie.facing = math.atan2(direction.y, direction.x)
-        speed = spec.speed * self.difficulty.zombie_speed_multiplier * (1.22 if sprint else 1.0)
+        indoor_boost = 1.08 if sprint and point_building(self.buildings, zombie.pos) else 1.0
+        speed = spec.speed * self.difficulty.zombie_speed_multiplier * (1.28 if sprint else 1.0) * indoor_boost
         step = direction.normalized().scaled(speed * dt)
         old_pos = zombie.pos.copy()
         self._move_circle(zombie.pos, step, spec.radius, zombie.floor)
         if zombie.pos.distance_to(old_pos) < 0.5:
+            if patrol:
+                self._turn_patrol_from_wall(zombie, rng)
+                return False
             if self._unstick_zombie_from_building(zombie, spec.radius, rng):
-                zombie.waypoint = self._random_patrol_pos(rng)
-                return
+                zombie.waypoint = self._navigation_target(zombie.pos, target, zombie.floor, spec.radius, rng)
+                return True
             door = nearest_door(self.buildings, zombie.pos, 120, zombie.floor)
             if door and door.open:
                 zombie.waypoint = door.rect.center
             else:
-                zombie.waypoint = self._random_patrol_pos(rng)
+                zombie.waypoint = self._navigation_target(zombie.pos, target, zombie.floor, spec.radius, rng)
+            return False
+        return True
+
+    def _turn_patrol_from_wall(self, zombie: ZombieState, rng: random.Random) -> None:
+        turn = rng.uniform(math.pi * 0.5, math.pi)
+        if rng.random() < 0.5:
+            turn = -turn
+        zombie.facing = (zombie.facing + turn) % math.tau
+        distance = rng.uniform(160, 340)
+        waypoint = Vec2(
+            zombie.pos.x + math.cos(zombie.facing) * distance,
+            zombie.pos.y + math.sin(zombie.facing) * distance,
+        )
+        waypoint.clamp_to_map(MAP_WIDTH, MAP_HEIGHT)
+        if self._blocked_at(waypoint, ZOMBIES[zombie.kind].radius, zombie.floor):
+            waypoint = self._navigation_target(zombie.pos, waypoint, zombie.floor, ZOMBIES[zombie.kind].radius, rng)
+        zombie.waypoint = waypoint
 
     def _leaper_move_toward(self, zombie: ZombieState, target: Vec2, dt: float, rng: random.Random) -> None:
         spec = ZOMBIES[zombie.kind]
+        target = self._navigation_target(zombie.pos, target, zombie.floor, spec.radius, rng)
         to_target = Vec2(target.x - zombie.pos.x, target.y - zombie.pos.y)
         distance = to_target.length()
         if distance <= 0.01:
@@ -797,7 +839,7 @@ class GameWorld:
         for player in players:
             if zombie.floor != player.floor:
                 continue
-            if player.inside_building:
+            if player.inside_building and player.inside_building != zombie.inside_building:
                 continue
             if player.noise <= 0.0:
                 continue
@@ -1434,6 +1476,7 @@ class GameWorld:
         player_damage: int,
         player_damage_bonus: int,
     ) -> None:
+        self._alert_zombies_to_noise(pos, floor, EXPLOSION_NOISE_RADIUS, owner_id)
         for zombie in list(self.zombies.values()):
             if zombie.floor != floor:
                 continue
@@ -1449,6 +1492,21 @@ class GameWorld:
             if distance <= player_radius and not self._line_blocked(pos, player.pos, floor):
                 damage = int(player_damage * (1.0 - distance / player_radius)) + player_damage_bonus
                 self._damage_player(player, damage)
+
+    def _alert_zombies_to_noise(self, pos: Vec2, floor: int, radius: float, owner_id: str | None = None) -> None:
+        for zombie in self.zombies.values():
+            if zombie.floor != floor:
+                continue
+            distance = zombie.pos.distance_to(pos)
+            if distance > radius:
+                continue
+            if self._line_blocked(zombie.pos, pos, floor, sound=True) and distance > radius * 0.45:
+                continue
+            zombie.mode = "investigate"
+            zombie.last_known_pos = pos.copy()
+            zombie.target_player_id = owner_id if owner_id in self.players else zombie.target_player_id
+            zombie.search_timer = max(zombie.search_timer, SEARCH_DURATION * 0.75)
+            zombie.alertness = max(zombie.alertness, 0.85)
 
     def _pickup_nearby(self, player: PlayerState) -> None:
         closest = None
@@ -1743,13 +1801,236 @@ class GameWorld:
                 return True
         return False
 
-    def _line_blocked(self, start: Vec2, end: Vec2, floor: int, sound: bool = False) -> bool:
-        for wall in self._closed_walls(floor):
-            if _segment_rect_intersects(start, end, wall):
-                if sound and wall.w < 28 and wall.h < 90:
+    def _navigation_target(
+        self,
+        start: Vec2,
+        target: Vec2,
+        floor: int,
+        radius: float,
+        rng: random.Random,
+    ) -> Vec2:
+        if not self._line_blocked(start, target, floor):
+            return target
+
+        graph_step = self._visibility_graph_target(start, target, floor, radius, rng)
+        if graph_step:
+            return graph_step
+
+        blocking_wall = self._first_blocking_wall(start, target, floor)
+        if not blocking_wall:
+            return target
+        local_step = self._local_obstacle_target(start, target, floor, radius, rng, blocking_wall)
+        if local_step:
+            return local_step
+        return self._sidestep_navigation_target(start, target, floor, radius, rng)
+
+    def _visibility_graph_target(
+        self,
+        start: Vec2,
+        target: Vec2,
+        floor: int,
+        radius: float,
+        rng: random.Random,
+    ) -> Vec2 | None:
+        nodes = self._navigation_nodes(start, target, floor, radius, rng)
+        if not nodes:
+            return None
+        points = [start, target, *nodes]
+        target_index = 1
+        graph: list[list[tuple[int, float]]] = [[] for _ in points]
+        for index, point in enumerate(points):
+            for other_index in range(index + 1, len(points)):
+                other = points[other_index]
+                if self._line_blocked(point, other, floor):
                     continue
-                return True
-        return False
+                distance = point.distance_to(other)
+                graph[index].append((other_index, distance))
+                graph[other_index].append((index, distance))
+
+        queue: list[tuple[float, float, int]] = [(0.0, 0.0, 0)]
+        distances = {0: 0.0}
+        previous: dict[int, int] = {}
+        while queue:
+            _priority, current_distance, index = heappop(queue)
+            if index == target_index:
+                break
+            if current_distance > distances.get(index, float("inf")):
+                continue
+            for next_index, edge_distance in graph[index]:
+                new_distance = current_distance + edge_distance
+                if new_distance >= distances.get(next_index, float("inf")):
+                    continue
+                distances[next_index] = new_distance
+                previous[next_index] = index
+                heuristic = points[next_index].distance_to(target)
+                heappush(queue, (new_distance + heuristic, new_distance, next_index))
+
+        if target_index not in distances:
+            return None
+        index = target_index
+        while previous.get(index) not in (None, 0):
+            index = previous[index]
+        if previous.get(index) is None:
+            return target
+        return points[index]
+
+    def _navigation_nodes(
+        self,
+        start: Vec2,
+        target: Vec2,
+        floor: int,
+        radius: float,
+        rng: random.Random,
+    ) -> list[Vec2]:
+        walls = self._navigation_walls(start, target, floor)
+        margin = radius + NAVIGATION_MARGIN
+        nodes: list[Vec2] = []
+        seen: set[tuple[int, int]] = set()
+
+        def add(candidate: Vec2) -> None:
+            candidate.clamp_to_map(MAP_WIDTH, MAP_HEIGHT)
+            key = (int(candidate.x // 16), int(candidate.y // 16))
+            if key in seen or self._blocked_at(candidate, radius, floor):
+                return
+            seen.add(key)
+            nodes.append(candidate)
+
+        for wall in walls:
+            add(Vec2(wall.x - margin, wall.y - margin))
+            add(Vec2(wall.x + wall.w + margin, wall.y - margin))
+            add(Vec2(wall.x - margin, wall.y + wall.h + margin))
+            add(Vec2(wall.x + wall.w + margin, wall.y + wall.h + margin))
+            if wall.w > wall.h:
+                add(Vec2(wall.x - margin, wall.y + wall.h * 0.5))
+                add(Vec2(wall.x + wall.w + margin, wall.y + wall.h * 0.5))
+            else:
+                add(Vec2(wall.x + wall.w * 0.5, wall.y - margin))
+                add(Vec2(wall.x + wall.w * 0.5, wall.y + wall.h + margin))
+
+        for building in self.buildings.values():
+            for door in building.doors:
+                if door.floor != floor or not door.open:
+                    continue
+                center = door.rect.center
+                if not self._point_near_navigation_corridor(center, start, target, NAVIGATION_CORRIDOR_PADDING):
+                    continue
+                add(center)
+                if door.rect.w >= door.rect.h:
+                    add(Vec2(center.x, center.y - margin))
+                    add(Vec2(center.x, center.y + margin))
+                else:
+                    add(Vec2(center.x - margin, center.y))
+                    add(Vec2(center.x + margin, center.y))
+
+        nodes.sort(key=lambda point: start.distance_to(point) + point.distance_to(target) + rng.random() * 2.0)
+        return nodes[:NAVIGATION_MAX_NODES]
+
+    def _navigation_walls(self, start: Vec2, target: Vec2, floor: int) -> list[RectState]:
+        walls = []
+        for wall in self._closed_walls(floor):
+            if self._point_near_navigation_corridor(wall.center, start, target, NAVIGATION_CORRIDOR_PADDING):
+                walls.append(wall)
+        walls.sort(key=lambda wall: start.distance_to(wall.center) + wall.center.distance_to(target))
+        return walls[: max(8, NAVIGATION_MAX_NODES // 2)]
+
+    def _point_near_navigation_corridor(self, point: Vec2, start: Vec2, target: Vec2, padding: float) -> bool:
+        min_x = min(start.x, target.x) - padding
+        max_x = max(start.x, target.x) + padding
+        min_y = min(start.y, target.y) - padding
+        max_y = max(start.y, target.y) + padding
+        return min_x <= point.x <= max_x and min_y <= point.y <= max_y
+
+    def _local_obstacle_target(
+        self,
+        start: Vec2,
+        target: Vec2,
+        floor: int,
+        radius: float,
+        rng: random.Random,
+        blocking_wall: RectState,
+    ) -> Vec2 | None:
+        margin = radius + NAVIGATION_MARGIN
+        candidates = [
+            Vec2(blocking_wall.x - margin, blocking_wall.y - margin),
+            Vec2(blocking_wall.x + blocking_wall.w + margin, blocking_wall.y - margin),
+            Vec2(blocking_wall.x - margin, blocking_wall.y + blocking_wall.h + margin),
+            Vec2(blocking_wall.x + blocking_wall.w + margin, blocking_wall.y + blocking_wall.h + margin),
+        ]
+        if blocking_wall.w > blocking_wall.h:
+            candidates.extend(
+                [
+                    Vec2(blocking_wall.x - margin, blocking_wall.y + blocking_wall.h * 0.5),
+                    Vec2(blocking_wall.x + blocking_wall.w + margin, blocking_wall.y + blocking_wall.h * 0.5),
+                ]
+            )
+        else:
+            candidates.extend(
+                [
+                    Vec2(blocking_wall.x + blocking_wall.w * 0.5, blocking_wall.y - margin),
+                    Vec2(blocking_wall.x + blocking_wall.w * 0.5, blocking_wall.y + blocking_wall.h + margin),
+                ]
+            )
+
+        open_candidates: list[tuple[float, Vec2]] = []
+        fallback_candidates: list[tuple[float, Vec2]] = []
+        for candidate in candidates:
+            candidate.clamp_to_map(MAP_WIDTH, MAP_HEIGHT)
+            if self._blocked_at(candidate, radius, floor):
+                continue
+            start_blocked = self._line_blocked(start, candidate, floor)
+            target_blocked = self._line_blocked(candidate, target, floor)
+            score = start.distance_to(candidate) + candidate.distance_to(target)
+            score += rng.random() * 4.0
+            if not start_blocked and not target_blocked:
+                open_candidates.append((score, candidate))
+            elif not start_blocked:
+                fallback_candidates.append((score + 420.0, candidate))
+
+        if open_candidates:
+            return min(open_candidates, key=lambda item: item[0])[1]
+        if fallback_candidates:
+            return min(fallback_candidates, key=lambda item: item[0])[1]
+        return None
+
+    def _sidestep_navigation_target(
+        self,
+        start: Vec2,
+        target: Vec2,
+        floor: int,
+        radius: float,
+        rng: random.Random,
+    ) -> Vec2:
+        direction = Vec2(target.x - start.x, target.y - start.y).normalized()
+        if direction.length() <= 0.0:
+            direction = Vec2(math.cos(rng.uniform(0, math.tau)), math.sin(rng.uniform(0, math.tau)))
+        perpendicular = Vec2(-direction.y, direction.x)
+        probes: list[Vec2] = []
+        for side in (1.0, -1.0):
+            for distance in (96.0, 160.0, 240.0):
+                probes.append(Vec2(start.x + perpendicular.x * side * distance, start.y + perpendicular.y * side * distance))
+        rng.shuffle(probes)
+        for probe in probes:
+            probe.clamp_to_map(MAP_WIDTH, MAP_HEIGHT)
+            if not self._blocked_at(probe, radius, floor) and not self._line_blocked(start, probe, floor):
+                return probe
+        return target
+
+    def _first_blocking_wall(self, start: Vec2, end: Vec2, floor: int, sound: bool = False) -> RectState | None:
+        best: RectState | None = None
+        best_distance = float("inf")
+        for wall in self._closed_walls(floor):
+            if sound and wall.w < 28 and wall.h < 90:
+                continue
+            if not _segment_rect_intersects(start, end, wall):
+                continue
+            distance = start.distance_to(wall.center)
+            if distance < best_distance:
+                best = wall
+                best_distance = distance
+        return best
+
+    def _line_blocked(self, start: Vec2, end: Vec2, floor: int, sound: bool = False) -> bool:
+        return self._first_blocking_wall(start, end, floor, sound=sound) is not None
 
     def snapshot(self) -> WorldSnapshot:
         with self._lock:
