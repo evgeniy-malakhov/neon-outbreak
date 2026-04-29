@@ -14,6 +14,7 @@ All files in this folder are UTF-8 JSON, except this documentation file. Restart
 - `backpack.json` configures the starting backpack.
 - `item_stacks.json` configures stack sizes for backpack items.
 - `icon_mapping.json` maps game ids to PNG filenames in `images/`.
+- `server.json` configures server networking, interest management, output queues and profiling thresholds.
 - `difficulty/*.json` configures world difficulty presets.
 
 ## Items
@@ -225,3 +226,51 @@ Starting items are created as common rarity.
 - loot spawn amount and spawn interval.
 
 Difficulty is applied by the authoritative server in online mode.
+
+## Server Networking
+
+`server.json` controls the optimized online server:
+
+- `network.interest_radius`: radius around each player for high-frequency entities such as zombies, loot, projectiles, grenades, mines and poison pools.
+- `network.building_interest_radius`: larger radius used for building state so doors/interiors arrive before the player reaches them.
+- `network.grid_cell_size`: spatial hash cell size used by interest management.
+- `network.output_queue_packets`: maximum queued outbound packets per client. If a client falls behind, old snapshot packets are dropped and the next snapshot is forced full.
+- `network.full_snapshot_interval_seconds`: how often each client receives a full resync even when delta snapshots are working.
+- `network.resume_timeout_seconds`: how long a disconnected player remains in the world and can resume with the same `session_token`.
+- `network.journal_seconds`: retention window for recent command results, gameplay events and snapshot metadata used by reconnect/replay diagnostics.
+- `network.write_buffer_high_water` and `network.write_buffer_low_water`: asyncio transport backpressure thresholds.
+- `profiling.log_interval_seconds`: interval for `python -m server.main --profile` metrics.
+- `profiling.slow_tick_ms` and `profiling.slow_snapshot_ms`: reserved thresholds for stricter profiling alerts.
+
+The TCP protocol uses length-prefixed frames. `msgpack` is used when installed; otherwise the same framing falls back to compact JSON. Snapshot packets are treated as lossy/unreliable inside the server queue, so stale snapshots can be dropped for slow clients. Login, profile updates, transactional commands, pings, command results and gameplay events stay on the reliable queue.
+
+Clients start with a versioned `hello` handshake containing `client_version`, `protocol_version`, `snapshot_schema` and supported features. The server answers with `welcome`, including `session_token`, `resume_timeout`, server features and a full snapshot. After a short connection drop, the client sends `resume` with `player_id`, `session_token` and `last_snapshot_tick`; the server restores the same player when the token is still valid.
+
+Snapshot messages include:
+
+- `tick`: authoritative server simulation tick.
+- `seq`: server snapshot sequence for this client.
+- `ack_input_seq`: last client input sequence processed by the server.
+- `server_time`: authoritative world time used by interpolation buffers.
+- `snapshot_interval`: expected time between snapshots.
+- `schema`: currently `compact-v1`.
+
+`compact-v1` keeps the local player as a full player object for inventory/HUD correctness, while remote players, zombies, projectiles, grenades, mines, poison pools and loot are sent as compact arrays. The client expands this schema back into the shared `WorldSnapshot` model.
+
+Gameplay events are delivered separately with message type `events`. They are meant for one-shot effects and UI feedback such as `shot`, `hit`, `player_died`, `zombie_killed`, `grenade_exploded`, `mine_exploded` and `item_picked`.
+
+Movement input and gameplay commands are intentionally separate:
+
+- `input`: frequent disposable state containing only movement, aim, shooting, sprint and sneak.
+- `command`: reliable ordered transaction with `command_id`, `kind` and `payload`.
+- `command_result`: authoritative result for exactly one command, including `ok`, `reason` when rejected, and `server_tick`.
+
+Current command kinds include `pickup`, `interact`, `inventory_action`, `craft`, `repair`, `equip_armor`, `select_slot`, `reload`, `throw_grenade`, `toggle_utility`, `use_medkit` and `respawn`. Movement input may be overwritten by a newer input before the next simulation tick; commands are queued and processed in order.
+
+The server keeps short command/event/snapshot journals for resume replay and desync debugging. Persistent records are written by a background worker into `server_data/` as JSON/JSONL files, outside the game tick:
+
+- `player_profiles.json`: latest player position, stats, inventory, equipment and weapons.
+- `session_history.jsonl`: connect, disconnect, resume and shutdown history.
+- `match_events.jsonl`: command results and gameplay events.
+
+On SIGTERM/SIGINT-capable platforms, the server stops accepting new clients, sends `server_shutdown`, saves active player profiles and closes connections cleanly.

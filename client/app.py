@@ -16,7 +16,7 @@ from shared.difficulty import DIFFICULTY_KEYS, load_difficulty
 from shared.explosives import GRENADE_SPECS, DEFAULT_GRENADE
 from shared.items import EQUIPMENT_SLOTS, ITEMS, RECIPES
 from shared.level import tunnel_segments
-from shared.models import BuildingState, InputCommand, LootState, PlayerState, RectState, Vec2, WorldSnapshot
+from shared.models import BuildingState, ClientCommand, InputCommand, LootState, PlayerState, RectState, Vec2, WorldSnapshot
 from shared.rarities import RARITY_KEYS, rarity_color, rarity_rank, rarity_spec
 from shared.simulation import GameWorld
 from shared.weapon_modules import WEAPON_MODULES, WEAPON_MODULE_SLOTS
@@ -56,6 +56,18 @@ DEFAULT_ICON_MAPPING = {
     "tactical": "tactical_vest",
     "heavy": "heavy_torso",
 }
+
+
+def _connection_icon_from_state(value: str) -> str:
+    if value in {"stable-connection", "unstable-connection", "packet-lost", "lost-connection"}:
+        return value
+    if value == "stable":
+        return "stable-connection"
+    if value == "unstable":
+        return "unstable-connection"
+    if value in {"packet_lost", "packet-lost"}:
+        return "packet-lost"
+    return "lost-connection" if value == "lost" else "unstable-connection"
 
 
 @dataclass(slots=True)
@@ -131,6 +143,7 @@ class GameApp:
         self.pending_repair_slot: str | None = None
         self.pending_slot: str | None = None
         self.pending_equip_armor: str | None = None
+        self._local_command_id = 0
         self.drag_source: dict[str, object] | None = None
         self.custom_weapon_slot = "1"
         self.settings = {
@@ -239,7 +252,7 @@ class GameApp:
     def _load_item_images(self) -> dict[str, pygame.Surface]:
         images: dict[str, pygame.Surface] = {}
         image_dir = ROOT / "images"
-        for path in image_dir.glob("*.png"):
+        for path in image_dir.rglob("*.png"):
             if path.exists():
                 try:
                     images[path.stem] = self._load_alpha_image(path)
@@ -662,24 +675,35 @@ class GameApp:
 
         if self.state == "single" and self.world and self.local_player_id:
             if self.settings_open or self.backpack_open or self.craft_open or self.weapon_custom_open:
-                if self.pending_inventory_action or self.pending_craft_key or self.pending_repair_slot:
-                    command = self._build_input(self.local_player_id)
-                    self.world.set_input(command)
-                    self.world.update(0.0)
-                    self._clear_transient_inputs()
+                self._dispatch_pending_commands(self.local_player_id)
+                command = self._build_input(self.local_player_id)
+                self.world.set_input(command)
+                self.world.update(0.0)
                 self._update_camera_zoom(dt)
                 self._update_damage_feedback(dt)
                 return
+            self._dispatch_pending_commands(self.local_player_id)
             command = self._build_input(self.local_player_id)
             self.world.set_input(command)
             self.world.update(dt)
-            self._clear_transient_inputs()
         elif self.state == "online_game" and self.online.player_id:
+            self._dispatch_pending_commands(self.online.player_id)
             command = self._build_input(self.online.player_id)
             self.online.send_input(command)
-            self._clear_transient_inputs()
+            self._handle_online_events()
         self._update_camera_zoom(dt)
         self._update_damage_feedback(dt)
+
+    def _handle_online_events(self) -> None:
+        if self.state != "online_game":
+            return
+        for event in self.online.poll_events():
+            kind = event.get("kind")
+            if kind == "server_shutdown":
+                self.online.error = self.tr("online.server_shutdown")
+                continue
+            if kind in {"hit", "player_died"} and event.get("target_id", event.get("player_id")) == self.online.player_id:
+                self.damage_flash = min(1.0, max(self.damage_flash, 0.35))
 
     def _update_camera_zoom(self, dt: float) -> None:
         snapshot = self._snapshot()
@@ -729,21 +753,56 @@ class GameApp:
             aim_x=mouse_world.x,
             aim_y=mouse_world.y,
             shooting=pygame.mouse.get_pressed(num_buttons=3)[0] and not ui_open,
-            reload=self.pending_reload,
-            pickup=self.pending_pickup,
-            interact=self.pending_interact,
-            use_medkit=self.pending_medkit,
             sprint=keys[pygame.K_LSHIFT] or keys[pygame.K_RSHIFT],
             sneak=keys[pygame.K_LCTRL] or keys[pygame.K_RCTRL],
-            respawn=self.pending_respawn,
-            throw_grenade=self.pending_throw_grenade,
-            toggle_utility=self.pending_toggle_utility,
-            inventory_action=self.pending_inventory_action,
-            craft_key=self.pending_craft_key,
-            repair_slot=self.pending_repair_slot,
-            active_slot=self.pending_slot,
-            equip_armor=self.pending_equip_armor,
         )
+
+    def _dispatch_pending_commands(self, player_id: str) -> None:
+        commands = self._pending_command_specs()
+        if not commands:
+            return
+        if self.state == "online_game":
+            if self.online.has_pending_commands():
+                return
+            sent_all = True
+            for kind, payload in commands:
+                sent_all = self.online.send_command(kind, payload) is not None and sent_all
+            if sent_all:
+                self._clear_transient_inputs()
+            return
+        if self.world:
+            for kind, payload in commands:
+                self._local_command_id += 1
+                self.world.apply_client_command(ClientCommand(player_id, self._local_command_id, kind, payload))
+            self._clear_transient_inputs()
+
+    def _pending_command_specs(self) -> list[tuple[str, dict[str, object]]]:
+        commands: list[tuple[str, dict[str, object]]] = []
+        if self.pending_slot:
+            commands.append(("select_slot", {"slot": self.pending_slot}))
+        if self.pending_reload:
+            commands.append(("reload", {}))
+        if self.pending_pickup:
+            commands.append(("pickup", {}))
+        if self.pending_interact:
+            commands.append(("interact", {}))
+        if self.pending_toggle_utility:
+            commands.append(("toggle_utility", {}))
+        if self.pending_respawn:
+            commands.append(("respawn", {}))
+        if self.pending_throw_grenade:
+            commands.append(("throw_grenade", {}))
+        if self.pending_medkit:
+            commands.append(("use_medkit", {}))
+        if self.pending_inventory_action:
+            commands.append(("inventory_action", dict(self.pending_inventory_action)))
+        if self.pending_craft_key:
+            commands.append(("craft", {"key": self.pending_craft_key}))
+        if self.pending_repair_slot:
+            commands.append(("repair", {"slot": self.pending_repair_slot}))
+        if self.pending_equip_armor:
+            commands.append(("equip_armor", {"armor_key": self.pending_equip_armor}))
+        return commands
 
     def _clear_transient_inputs(self) -> None:
         self.pending_reload = False
@@ -993,6 +1052,8 @@ class GameApp:
                 self._draw_damage_feedback(player)
             self._draw_hud(snapshot, player)
             self._draw_minimap(snapshot, player)
+            if self.state == "online_game":
+                self._draw_connection_status()
             if self.settings.get("show_zombie_count", False):
                 self._draw_zombie_counter(snapshot)
             self._draw_context_prompt(snapshot, player, camera)
@@ -1522,9 +1583,12 @@ class GameApp:
             self._draw_text_fit(label, rect.inflate(-10, -12), TEXT if weapon or quick_item else MUTED, self.small, center=True)
         self._draw_notice(player)
 
-    def _draw_minimap(self, snapshot: WorldSnapshot, player: PlayerState | None) -> None:
+    def _minimap_rect(self) -> pygame.Rect:
         size = 226 if self.minimap_big else 156
-        rect = pygame.Rect(SCREEN_W - size - 18, 18, size, int(size * MAP_HEIGHT / MAP_WIDTH))
+        return pygame.Rect(SCREEN_W - size - 18, 18, size, int(size * MAP_HEIGHT / MAP_WIDTH))
+
+    def _draw_minimap(self, snapshot: WorldSnapshot, player: PlayerState | None) -> None:
+        rect = self._minimap_rect()
         pygame.draw.rect(self.screen, PANEL, rect, border_radius=8)
         pygame.draw.rect(self.screen, CYAN, rect, 2, border_radius=8)
 
@@ -1553,6 +1617,33 @@ class GameApp:
                 max(2, int(building.bounds.h / MAP_HEIGHT * rect.h)),
             )
             pygame.draw.rect(self.screen, (84, 95, 118), mini, 1)
+
+    def _draw_connection_status(self) -> None:
+        minimap = self._minimap_rect()
+        rect = pygame.Rect(minimap.x - 116, minimap.y + 6, 96, 40)
+        quality = self.online.connection_quality()
+        ping = self._format_ping(self.online.ping_ms)
+        color = {
+            "stable-connection": GREEN,
+            "unstable-connection": YELLOW,
+            "packet-lost": RED,
+            "lost-connection": RED,
+        }.get(quality, MUTED)
+        surface = pygame.Surface(rect.size, pygame.SRCALPHA)
+        pygame.draw.rect(surface, (10, 16, 28, 206), surface.get_rect(), border_radius=8)
+        pygame.draw.rect(surface, (*color, 170), surface.get_rect(), 1, border_radius=8)
+        self.screen.blit(surface, rect)
+        icon_rect = pygame.Rect(rect.x + 8, rect.y + 7, 26, 26)
+        if not self._draw_item_icon(quality, icon_rect, aura=False, shadow=False):
+            pygame.draw.circle(self.screen, color, icon_rect.center, 8)
+        self._draw_text_fit(ping, pygame.Rect(rect.x + 40, rect.y + 10, rect.w - 48, 18), color, self.small)
+
+    def _format_ping(self, ping_ms: float | int | None) -> str:
+        if ping_ms is None or float(ping_ms) <= 0.0:
+            return "--"
+        if float(ping_ms) >= 1000.0:
+            return "999+"
+        return f"{float(ping_ms):.0f} ms"
 
     def _draw_zombie_counter(self, snapshot: WorldSnapshot) -> None:
         size = 226 if self.minimap_big else 156
@@ -1619,7 +1710,7 @@ class GameApp:
         overlay = pygame.Surface((SCREEN_W, SCREEN_H), pygame.SRCALPHA)
         overlay.fill((4, 7, 18, 206))
         self.screen.blit(overlay, (0, 0))
-        panel = pygame.Rect(250, 96, 780, 520)
+        panel = pygame.Rect((SCREEN_W - 900) // 2, 96, 900, 520)
         glow = pygame.Surface(panel.inflate(26, 26).size, pygame.SRCALPHA)
         pygame.draw.rect(glow, (76, 225, 255, 34), glow.get_rect(), border_radius=16)
         pygame.draw.rect(glow, (255, 91, 111, 24), glow.get_rect().inflate(-10, -10), 2, border_radius=14)
@@ -1635,14 +1726,15 @@ class GameApp:
             self.tr("scoreboard.runner"),
             self.tr("scoreboard.brute"),
             self.tr("scoreboard.leaper"),
+            self.tr("scoreboard.ping"),
             self.tr("scoreboard.status"),
         ]
-        xs = [panel.x + 42, panel.x + 286, panel.x + 365, panel.x + 452, panel.x + 535, panel.x + 618, panel.x + 700]
+        xs = [panel.x + 42, panel.x + 292, panel.x + 368, panel.x + 448, panel.x + 528, panel.x + 608, panel.x + 690, panel.x + 770]
         for x, header in zip(xs, headers):
             self._draw_text(header, x, panel.y + 112, CYAN if header == self.tr("scoreboard.total") else MUTED, self.small)
         y = panel.y + 150
         for player in sorted(snapshot.players.values(), key=lambda p: p.score, reverse=True):
-            row = pygame.Rect(panel.x + 30, y - 8, 720, 42)
+            row = pygame.Rect(panel.x + 30, y - 8, panel.w - 60, 42)
             row_color = (28, 42, 66) if player.alive else (48, 20, 31)
             border = GREEN if player.alive else RED
             if player.id == (self.local_player_id or self.online.player_id):
@@ -1661,6 +1753,7 @@ class GameApp:
                 str(player.kills_by_kind.get("runner", 0)),
                 str(player.kills_by_kind.get("brute", 0)),
                 str(player.kills_by_kind.get("leaper", 0)),
+                self._format_ping(player.ping_ms),
                 self.tr("state.alive") if player.alive else self.tr("state.dead"),
             ]
             self._draw_text_fit(
@@ -1669,9 +1762,19 @@ class GameApp:
                 TEXT if player.alive else RED,
                 self.font,
             )
-            for x, value in zip(xs[1:], values):
-                color = RED if value == self.tr("state.dead") else YELLOW if x == xs[1] else TEXT
-                self._draw_text(value, x, y, color, self.font)
+            for index, (x, value) in enumerate(zip(xs[1:], values), start=1):
+                if index == len(values):
+                    quality = _connection_icon_from_state(player.connection_quality)
+                    icon_rect = pygame.Rect(x, y - 3, 22, 22)
+                    if not self._draw_item_icon(quality, icon_rect, aura=False, shadow=False):
+                        pygame.draw.circle(self.screen, RED if not player.alive else GREEN, icon_rect.center, 7)
+                    color = RED if value == self.tr("state.dead") else TEXT
+                    self._draw_text_fit(value, pygame.Rect(x + 28, y, panel.right - x - 48, 20), color, self.small)
+                    continue
+                color = YELLOW if x == xs[1] else TEXT
+                if index == len(values) - 1 and value == "999+":
+                    color = RED
+                self._draw_text_fit(value, pygame.Rect(x, y, 66, 22), color, self.font)
             y += 52
 
     def _draw_death_overlay(self) -> None:

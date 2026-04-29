@@ -323,6 +323,8 @@ class PlayerState:
     poison_damage: int = 0
     notice: str = ""
     notice_timer: float = 0.0
+    ping_ms: int = 0
+    connection_quality: str = "stable"
     weapons: dict[str, WeaponRuntime] = field(default_factory=dict)
 
     def active_weapon(self) -> WeaponRuntime | None:
@@ -360,6 +362,8 @@ class PlayerState:
             "poison_damage": self.poison_damage,
             "notice": self.notice,
             "notice_timer": round(self.notice_timer, 3),
+            "ping_ms": self.ping_ms,
+            "connection_quality": self.connection_quality,
             "weapons": {slot: weapon.to_dict() for slot, weapon in self.weapons.items()},
         }
 
@@ -402,6 +406,8 @@ class PlayerState:
             poison_damage=int(data.get("poison_damage", 0)),
             notice=str(data.get("notice", "")),
             notice_timer=float(data.get("notice_timer", 0.0)),
+            ping_ms=int(data.get("ping_ms", 0)),
+            connection_quality=str(data.get("connection_quality", "stable")),
         )
         player.weapons = {
             str(slot): WeaponRuntime.from_dict(weapon)
@@ -766,6 +772,32 @@ class InputCommand:
             repair_slot=data.get("repair_slot"),
             active_slot=data.get("active_slot"),
             equip_armor=data.get("equip_armor"),
+        )
+
+
+@dataclass(slots=True)
+class ClientCommand:
+    player_id: str
+    command_id: int
+    kind: str
+    payload: dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "player_id": self.player_id,
+            "command_id": self.command_id,
+            "kind": self.kind,
+            "payload": dict(self.payload),
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "ClientCommand":
+        payload = data.get("payload", {})
+        return cls(
+            player_id=str(data.get("player_id", "")),
+            command_id=max(0, int(data.get("command_id", 0))),
+            kind=str(data.get("kind", "")),
+            payload=payload if isinstance(payload, dict) else {},
         )
 
 
