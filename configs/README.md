@@ -229,31 +229,47 @@ Difficulty is applied by the authoritative server in online mode.
 
 ## Server Networking
 
-`server.json` controls the optimized online server:
+`server.json` controls the optimized online server. The default profile is aimed at smooth 1-10 player sessions with 50 players as the practical cap:
 
 - `simulation.tick_rate`: authoritative simulation ticks per second. Higher values improve responsiveness but increase CPU cost.
-- `simulation.snapshot_rate`: maximum snapshot send rate per client before adaptive throttling. Higher values improve smoothness but increase bandwidth and encoding cost.
+- `simulation.snapshot_rate`: maximum snapshot send rate per client before adaptive throttling. The default keeps small 1-15 player sessions at 24 Hz while the client predicts local movement every rendered frame.
 - `network.max_clients`: hard cap for simultaneously connected players. Resume tickets do not count as connected players, but they still keep players in the world until timeout.
+- `network.listen_backlog`: TCP accept backlog for connection bursts during load tests or server-list joins.
 - `network.interest_radius`: radius around each player for high-frequency entities such as zombies, loot, projectiles, grenades, mines and poison pools.
 - `network.building_interest_radius`: larger radius used for building state so doors/interiors arrive before the player reaches them.
 - `network.grid_cell_size`: spatial hash cell size used by interest management.
 - `network.output_queue_packets`: maximum queued outbound packets per client. If a client falls behind, old snapshot packets are dropped and the next snapshot is forced full.
 - `network.command_queue_limit`: maximum reliable commands waiting for one player inside the simulation runner.
+- `network.snapshot_send_batch_size`: number of clients served by one delivery batch inside a snapshot round. The server time-slices batches across the round, so one large client list does not monopolize the event loop.
+- `network.max_pending_snapshots_per_client`: maximum stale realtime snapshots kept per client. Keep this at `1` for realtime gameplay; old snapshots are not useful.
+- `network.adaptive_snapshot_medium_clients` / `network.adaptive_snapshot_medium_rate`: when the online match reaches this player count, cap snapshot delivery to the configured medium rate. Defaults keep 16-32 players at 20 Hz.
+- `network.adaptive_snapshot_high_clients` / `network.adaptive_snapshot_high_rate`: high-load snapshot cap for the 33-44 player range.
+- `network.adaptive_snapshot_extreme_clients` / `network.adaptive_snapshot_extreme_rate`: final cap for 45-50 player servers. This deliberately favors command/ping responsiveness over visual update frequency.
+- `network.slow_client_snapshot_stride`: per-client snapshot stride used while a client is marked slow by outbound queue delay.
+- `network.slow_client_outbox_wait_ms`: marks a client slow when a packet waited this long in its output queue.
+- `network.slow_client_recovery_seconds`: how long slow-client snapshot throttling remains active after a backpressure spike.
+- `network.connection_burst_window_seconds`, `network.connection_burst_threshold` and `network.connection_burst_snapshot_rate`: temporarily lower snapshot fan-out while many TCP clients are connecting at once.
+- `network.state_hash_sample_seconds`: minimum interval between server-side snapshot hashes stored for desync checks. Hashing is intentionally sampled because stable JSON hashing is expensive.
 - `network.full_snapshot_interval_seconds`: how often each client receives a full resync even when delta snapshots are working.
 - `network.resume_timeout_seconds`: how long a disconnected player remains in the world and can resume with the same `session_token`.
 - `network.journal_seconds`: retention window for recent command results, gameplay events and snapshot metadata used by reconnect/replay diagnostics.
-- `network.write_buffer_high_water` and `network.write_buffer_low_water`: asyncio transport backpressure thresholds.
+- `network.write_buffer_high_water` and `network.write_buffer_low_water`: asyncio transport backpressure thresholds. Higher values absorb short fan-out bursts; stale realtime snapshots are still capped by `max_pending_snapshots_per_client`.
 - `rate_limits.input_per_second`: maximum movement input messages accepted from one player per second.
 - `rate_limits.command_per_second`: maximum reliable command messages accepted from one player per second.
 - `rate_limits.inbound_bytes_per_second`: maximum inbound bytes accepted from one connected player per second before closing the connection.
 - `observability.enabled`: starts or disables the lightweight HTTP probe server.
 - `observability.host` and `observability.port`: bind address for `/metrics`, `/health` and `/ready`.
+- If the observability port is already occupied, the game TCP server still starts and logs that HTTP probes are disabled for that process.
 - `profiling.log_interval_seconds`: interval for `python -m server.main --profile` metrics.
 - `profiling.slow_tick_ms` and `profiling.slow_snapshot_ms`: reserved thresholds for stricter profiling alerts.
 
 The TCP protocol uses length-prefixed frames. `msgpack` is used when installed; otherwise the same framing falls back to compact JSON. Snapshot packets are treated as lossy/unreliable inside the server queue, so stale snapshots can be dropped for slow clients. Login, profile updates, transactional commands, pings, command results and gameplay events stay on the reliable queue.
 
-Clients start with a versioned `hello` handshake containing `client_version`, `protocol_version`, `snapshot_schema` and supported features. The server answers with `welcome`, including `session_token`, `resume_timeout`, server features and a full snapshot. After a short connection drop, the client sends `resume` with `player_id`, `session_token` and `last_snapshot_tick`; the server restores the same player when the token is still valid.
+The server reuses a snapshot interest index within the same simulation tick. This avoids rebuilding the spatial index repeatedly during connection bursts, reconnects and snapshot fan-out.
+
+Clients start with a versioned `hello` handshake containing `client_version`, `protocol_version`, `snapshot_schema` and supported features. The server answers with `welcome`, including `session_token`, `resume_timeout`, `mode`, `pvp`, server features and a lightweight bootstrap snapshot containing the local player. The normal snapshot pipeline fills nearby world state immediately after that, which keeps burst joins cheap. After a short connection drop, the client sends `resume` with `player_id`, `session_token` and `last_snapshot_tick`; the server restores the same player when the token is still valid and sends a filtered full snapshot.
+
+Start a PvP server with `python -m server.main --mode pvp` or `--pvp`. In PvP mode the server sets `initial_zombies=0`, `max_zombies=0`, does not start zombie AI workers, and advertises `pvp=true` in ping/ready/welcome payloads so the client can badge the server list.
 
 Snapshot messages include:
 
@@ -289,12 +305,26 @@ The normal game-server ping response also includes `ready`, `max_players`, `tick
 Main `/metrics` series:
 
 - `neon_connected_players`: currently connected players.
+- `neon_effective_snapshot_rate`: currently active adaptive snapshot rate after player-count caps.
 - `neon_tick_ms_avg`, `neon_tick_ms_p95`, `neon_tick_ms_p99`, plus `neon_tick_ms{quantile="avg|p95|p99"}` and `neon_tick_ms_count`: simulation tick duration. Rising p95/p99 means AI, physics, commands or world update cost is too high.
 - `neon_snapshot_ms_avg`, `neon_snapshot_ms_p95`, `neon_snapshot_ms_p99`, plus `neon_snapshot_ms{quantile="avg|p95|p99"}` and `neon_snapshot_ms_count`: snapshot build/filter/queue loop duration. Rising values point to interest filtering, delta encoding or per-client queue pressure.
 - `neon_command_ack_ms_avg`, `neon_command_ack_ms_p95`, `neon_command_ack_ms_p99`, plus `neon_command_ack_ms{quantile="avg|p95|p99"}` and `neon_command_ack_ms_count`: server-side reliable command processing latency from receive to result generation.
+- `neon_world_update_ms_*`: cost of world update, zombie movement, combat, projectiles and collisions.
+- `neon_command_apply_ms_*`: cost of applying queued reliable commands inside the simulation tick.
+- `neon_input_apply_ms_*`: cost of applying latest movement inputs inside the simulation tick.
+- `neon_snapshot_collect_ms_*`: cost of collecting the authoritative world snapshot from simulation state.
+- `neon_interest_filter_ms_*`: cost of per-client interest filtering and snapshot preparation for the served batch.
+- `neon_delta_build_ms_*`: cost of comparing the current filtered snapshot with the previous client snapshot.
+- `neon_compact_encode_ms_*`: cost of compact schema packing plus protocol frame encoding.
+- `neon_transport_write_ms_*`: time spent writing packets to asyncio transports and waiting for backpressure.
+- `neon_outbox_wait_ms_*`: time packets spent inside per-client output queues before the writer sends them. High values mean queue pressure is delaying control or snapshot delivery.
+
+Local-player delta snapshots send inventory/equipment as a full player payload only when those heavy fields change. Ordinary movement, aim, health, armor and active-weapon updates stay in the compact row schema to keep snapshot traffic low.
+
 - `neon_commands_rejected_total`: invalid, rate-limited or game-rule rejected commands.
 - `neon_reconnect_total`: successful resume handshakes.
 - `neon_dropped_snapshots_total`: stale snapshot packets dropped from slow-client queues.
+- `neon_skipped_snapshots_total`: snapshot builds skipped before interest filtering because a client was already backpressured.
 - `neon_bytes_sent_total` and `neon_bytes_received_total`: raw game-protocol traffic counters.
 - `neon_desync_reports_total`: client snapshot hashes received by the desync detector.
 - `neon_desync_mismatch_total`: mismatched client/server hashes.
@@ -302,6 +332,8 @@ Main `/metrics` series:
 - `neon_rate_limited_inputs_total`, `neon_rate_limited_commands_total`, `neon_rate_limited_bytes_total`: rate-limit pressure by category.
 - `neon_resume_tickets`: disconnected players still resumable.
 - `neon_output_queue_packets`: total queued outbound packets across connected clients.
+- `neon_slow_clients`: clients currently under slow-client snapshot throttling.
+- `neon_connection_burst_count`: accepted TCP connections currently inside the burst-detection window.
 - `neon_persistence_queue_size`: records waiting for the persistence worker.
 
 Python/process-specific metrics:

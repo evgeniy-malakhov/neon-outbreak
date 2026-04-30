@@ -16,7 +16,7 @@ from server.http_endpoints import ServerHTTPProbe
 from server.journal import ServerJournal
 from server.persistence import PersistenceWorker
 from server.runtime_metrics import ServerMetrics
-from server.spatial import SnapshotInterestIndex, filter_snapshot_area, snapshot_with_local_player
+from server.spatial import POSITION_COLLECTIONS, SnapshotInterestIndex, filter_snapshot_area, snapshot_with_local_player
 from server.workers import AsyncLogWorker, ServerProfiler
 from shared.constants import SNAPSHOT_RATE, TICK_RATE
 from shared.net_schema import SNAPSHOT_SCHEMA, compact_delta, compact_snapshot
@@ -43,13 +43,22 @@ class SimulationRunner:
         snapshot_rate: int = SNAPSHOT_RATE,
         command_queue_limit: int = 128,
         zombie_workers: int | None = None,
+        pvp: bool = False,
         tick_observer: Callable[[float], None] | None = None,
+        stage_observer: Callable[[str, float], None] | None = None,
     ) -> None:
-        self.world = GameWorld(difficulty_key=difficulty_key, zombie_workers=zombie_workers)
+        self.pvp = pvp
+        self.world = GameWorld(
+            difficulty_key=difficulty_key,
+            initial_zombies=0 if pvp else None,
+            max_zombies=0 if pvp else None,
+            zombie_workers=0 if pvp else zombie_workers,
+        )
         self.tick_rate = max(1, int(tick_rate))
         self.snapshot_rate = max(1, int(snapshot_rate))
         self.command_queue_limit = max(1, int(command_queue_limit))
         self.tick_observer = tick_observer
+        self.stage_observer = stage_observer
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._run, name="simulation-runner", daemon=True)
         self._input_lock = threading.Lock()
@@ -192,9 +201,15 @@ class SimulationRunner:
 
             if now >= next_tick:
                 started = time.perf_counter()
+                stage_started = time.perf_counter()
                 self._apply_pending_commands()
+                self._observe_stage("command_apply_ms", time.perf_counter() - stage_started)
+                stage_started = time.perf_counter()
                 self._apply_pending_inputs()
+                self._observe_stage("input_apply_ms", time.perf_counter() - stage_started)
+                stage_started = time.perf_counter()
                 self.world.update(dt)
+                self._observe_stage("world_update_ms", time.perf_counter() - stage_started)
                 self._collect_domain_events()
                 self._tick_id += 1
                 self._last_tick_seconds = time.perf_counter() - started
@@ -273,17 +288,25 @@ class SimulationRunner:
             self._domain_events.extend(events)
 
     def _refresh_snapshot(self) -> None:
-        self._publish_snapshot(SimulationSnapshot(self.world.snapshot().to_dict(), self._tick_id))
+        started = time.perf_counter()
+        snapshot = SimulationSnapshot(self.world.snapshot().to_dict(), self._tick_id)
+        self._observe_stage("snapshot_collect_ms", time.perf_counter() - started)
+        self._publish_snapshot(snapshot)
 
     def _publish_snapshot(self, snapshot: SimulationSnapshot) -> None:
         with self._snapshot_lock:
             self._snapshot = snapshot
+
+    def _observe_stage(self, name: str, seconds: float) -> None:
+        if self.stage_observer:
+            self.stage_observer(name, seconds)
 
 
 @dataclass(slots=True)
 class OutboundPacket:
     payload: bytes
     kind: str = "control"
+    created_at: float = field(default_factory=time.perf_counter)
 
 
 class ClientOutputQueue:
@@ -310,9 +333,31 @@ class ClientOutputQueue:
             return False
         return self._drop_oldest_snapshot()
 
+    def pending_snapshots(self) -> int:
+        return len(self._unreliable)
+
+    def trim_snapshots(self, max_pending: int = 1) -> int:
+        dropped = 0
+        while len(self._unreliable) > max(0, max_pending):
+            self._unreliable.popleft()
+            dropped += 1
+        return dropped
+
+    def replace_snapshot(self, packet: OutboundPacket, max_pending: int = 1) -> int:
+        dropped = self.trim_snapshots(max(0, max_pending - 1))
+        if max_pending <= 1 and self._unreliable:
+            self._unreliable.clear()
+            dropped += 1
+        self._unreliable.append(packet)
+        self._event.set()
+        return dropped
+
     def put(self, packet: OutboundPacket) -> bool:
         if self._closed:
             return False
+        if packet.kind == "snapshot":
+            self.replace_snapshot(packet)
+            return True
         if self.full:
             self._drop_oldest_snapshot()
         if self.full:
@@ -370,6 +415,8 @@ class ClientSession:
     snapshot_skip: int = 0
     ping_ms: float | None = None
     last_seen: float = 0.0
+    last_hash_tick: int = -1
+    slow_until: float = 0.0
     snapshot_hashes: Deque[tuple[int, str]] = field(default_factory=lambda: deque(maxlen=96))
     rate_window_started: float = 0.0
     input_count_window: int = 0
@@ -400,6 +447,7 @@ class GameProtocol(asyncio.Protocol):
     def connection_made(self, transport: asyncio.BaseTransport) -> None:
         self.transport = transport  # type: ignore[assignment]
         self.server.metrics.accepted_connections_total += 1
+        self.server.note_connection_attempt()
         if self.transport:
             self.transport.set_write_buffer_limits(
                 high=self.server.tuning.network.write_buffer_high_water,
@@ -451,23 +499,29 @@ class GameServer:
         port: int,
         difficulty_key: str = "medium",
         *,
+        pvp: bool = False,
         profile: bool = False,
         zombie_workers: int | None = None,
     ) -> None:
         self.host = host
         self.port = port
         self.difficulty_key = difficulty_key
+        self.pvp = pvp
+        self.server_mode = "pvp" if pvp else "survival"
         self.tuning: ServerTuning = load_server_tuning()
         self.metrics = ServerMetrics()
         self.tick_rate = self.tuning.simulation.tick_rate
         self.snapshot_rate = self.tuning.simulation.snapshot_rate
+        self._current_snapshot_rate = self.snapshot_rate
         self.simulation = SimulationRunner(
             difficulty_key,
             tick_rate=self.tick_rate,
             snapshot_rate=self.snapshot_rate,
             command_queue_limit=self.tuning.network.command_queue_limit,
             zombie_workers=zombie_workers,
+            pvp=pvp,
             tick_observer=self.metrics.observe_tick,
+            stage_observer=self.metrics.observe_stage,
         )
         self.clients: dict[str, ClientSession] = {}
         self.resume_tickets: dict[str, ResumeTicket] = {}
@@ -483,6 +537,10 @@ class GameServer:
         self.profiler = ServerProfiler(enabled=profile)
         self.profile_enabled = profile
         self._event_source_snapshot: dict[str, Any] | None = None
+        self._snapshot_cursor = 0
+        self._interest_index_cache_key: tuple[Any, ...] | None = None
+        self._interest_index_cache: SnapshotInterestIndex | None = None
+        self._connection_times: Deque[float] = deque()
 
     async def start(self) -> None:
         await self.log_worker.start()
@@ -499,8 +557,20 @@ class GameServer:
                     health=self._health_payload,
                     ready=self._ready_payload,
                 )
-                await self.http_probe.start()
-            self._server = await loop.create_server(lambda: GameProtocol(self), self.host, self.port)
+                try:
+                    await self.http_probe.start()
+                except OSError as exc:
+                    self.log_worker.info(
+                        f"HTTP probes disabled: {self.tuning.observability.host}:{self.tuning.observability.port} "
+                        f"is unavailable ({exc})"
+                    )
+                    self.http_probe = None
+            self._server = await loop.create_server(
+                lambda: GameProtocol(self),
+                self.host,
+                self.port,
+                backlog=self.tuning.network.listen_backlog,
+            )
             self._tasks = [
                 asyncio.create_task(self._snapshot_loop(), name="snapshot-sender"),
                 asyncio.create_task(self._command_result_loop(), name="command-results"),
@@ -510,7 +580,7 @@ class GameServer:
                 self._tasks.append(asyncio.create_task(self._profile_loop(), name="server-profiler"))
             sockets = ", ".join(str(sock.getsockname()) for sock in self._server.sockets or [])
             self.log_worker.info(
-                f"Neon Outbreak server listening on {sockets} [{self.difficulty_key}] "
+                f"Neon Outbreak server listening on {sockets} [{self.server_mode}/{self.difficulty_key}] "
                 f"codec={SERIALIZER_NAME} tick={self.tick_rate}Hz snapshots={self.snapshot_rate}Hz"
             )
             if self.http_probe:
@@ -518,7 +588,13 @@ class GameServer:
                     f"HTTP probes listening on {self.tuning.observability.host}:{self.tuning.observability.port} "
                     "(/metrics /health /ready)"
                 )
-            self.persistence.record_session("server_started", host=self.host, port=self.port, difficulty=self.difficulty_key)
+            self.persistence.record_session(
+                "server_started",
+                host=self.host,
+                port=self.port,
+                difficulty=self.difficulty_key,
+                mode=self.server_mode,
+            )
             async with self._server:
                 await self._shutdown_event.wait()
         finally:
@@ -651,10 +727,10 @@ class GameServer:
         self.clients[player.id] = session
         session.writer_task = asyncio.create_task(self._writer_loop(session), name=f"writer-{player.id}")
         snapshot_data = self._snapshot_with_network_stats(snapshot.data)
-        filtered = self._filter_snapshot(snapshot_data, player.id)
+        filtered = self._bootstrap_snapshot(snapshot_data, player.id)
         session.last_snapshot = filtered
         session.last_snapshot_tick = snapshot.tick
-        session.snapshot_hashes.append((snapshot.tick, snapshot_hash(filtered)))
+        self._remember_snapshot_hash(session, snapshot.tick, filtered, force=True)
         session.snapshots_since_full = 0
         self._queue_control(
             session,
@@ -674,6 +750,8 @@ class GameServer:
             snapshot_schema=SNAPSHOT_SCHEMA,
             server_version=SERVER_VERSION,
             server_features=SERVER_FEATURES,
+            mode=self.server_mode,
+            pvp=self.pvp,
         )
         self.log_worker.info(f"player connected: {name} ({player.id})")
         self.persistence.record_session("player_connected", player_id=player.id, name=name)
@@ -713,10 +791,10 @@ class GameServer:
         self.clients[player_id] = session
         self.resume_tickets.pop(player_id, None)
         session.writer_task = asyncio.create_task(self._writer_loop(session), name=f"writer-{player_id}")
-        filtered = self._filter_snapshot(snapshot_data, player_id)
+        filtered = self._filter_snapshot(snapshot_data, player_id, snapshot.tick)
         session.last_snapshot = filtered
         session.last_snapshot_tick = snapshot.tick
-        session.snapshot_hashes.append((snapshot.tick, snapshot_hash(filtered)))
+        self._remember_snapshot_hash(session, snapshot.tick, filtered, force=True)
         self._queue_control(
             session,
             "welcome",
@@ -736,6 +814,8 @@ class GameServer:
             snapshot_schema=SNAPSHOT_SCHEMA,
             server_version=SERVER_VERSION,
             server_features=SERVER_FEATURES,
+            mode=self.server_mode,
+            pvp=self.pvp,
         )
         last_tick = int(message.get("last_snapshot_tick", 0))
         results, events = self.journal.replay_for_player(player_id, last_tick)
@@ -884,9 +964,12 @@ class GameServer:
             "ready": self._ready_payload()["ready"],
             "zombies": self.simulation.zombie_count(),
             "difficulty": self.difficulty_key,
+            "mode": self.server_mode,
+            "pvp": self.pvp,
             "tick_ms": round(self.simulation.tick_seconds() * 1000.0, 2),
             "tick_rate": self.tick_rate,
             "snapshot_rate": self.snapshot_rate,
+            "effective_snapshot_rate": self._current_snapshot_rate,
             "codec": SERIALIZER_NAME,
             "protocol": "tcp-frame-v4",
             "protocol_version": PROTOCOL_VERSION,
@@ -905,23 +988,34 @@ class GameServer:
                 packet = await session.outbox.get()
                 if packet is None:
                     return
+                outbox_wait = time.perf_counter() - packet.created_at
+                self.metrics.observe_stage("outbox_wait_ms", outbox_wait)
+                if outbox_wait * 1000.0 >= self.tuning.network.slow_client_outbox_wait_ms:
+                    self._mark_slow_client(session)
+                write_started = time.perf_counter()
                 await session.protocol.wait_writable()
                 session.protocol.write(packet.payload)
                 await session.protocol.wait_writable()
+                self.metrics.observe_stage("transport_write_ms", time.perf_counter() - write_started)
         except (ConnectionError, OSError, RuntimeError):
             session.protocol.close()
         except asyncio.CancelledError:
             raise
 
     async def _snapshot_loop(self) -> None:
-        delay = 1.0 / self.snapshot_rate
-        next_send = asyncio.get_running_loop().time()
+        loop = asyncio.get_running_loop()
+        next_send = loop.time()
         while True:
+            effective_snapshot_rate = self._effective_snapshot_rate()
+            self._current_snapshot_rate = effective_snapshot_rate
+            delay = 1.0 / effective_snapshot_rate
             next_send += delay
-            await asyncio.sleep(max(0.0, next_send - asyncio.get_running_loop().time()))
+            await asyncio.sleep(max(0.0, next_send - loop.time()))
             if not self.clients:
                 continue
+            round_started = loop.time()
             started = time.perf_counter()
+            sleeping_seconds = 0.0
             snapshot = self.simulation.snapshot()
             snapshot_data = self._snapshot_with_network_stats(snapshot.data)
             self.journal.append_snapshot_meta(
@@ -933,7 +1027,7 @@ class GameServer:
                     "resume_tickets": len(self.resume_tickets),
                 },
             )
-            index = SnapshotInterestIndex(snapshot_data, self.tuning.network.grid_cell_size)
+            index = self._interest_index(snapshot_data, snapshot.tick)
             events = derive_events(self._event_source_snapshot, snapshot_data, snapshot.tick)
             for event in events:
                 self.journal.append_event(event, snapshot.tick)
@@ -945,43 +1039,59 @@ class GameServer:
                 )
             self._event_source_snapshot = snapshot_data
             area_cache: dict[tuple[int, int, int, str], dict[str, Any]] = {}
-            for session in list(self.clients.values()):
-                if snapshot.tick <= session.last_snapshot_tick:
-                    continue
-                session.snapshot_stride = self._adaptive_snapshot_stride(session)
-                if session.snapshot_stride > 1:
-                    session.snapshot_skip = (session.snapshot_skip + 1) % session.snapshot_stride
-                    if session.snapshot_skip:
+            batches = self._snapshot_batches()
+            batch_spacing = delay / max(1, len(batches))
+            for batch_index, sessions in enumerate(batches):
+                interest_started = time.perf_counter()
+                for session in sessions:
+                    if self.clients.get(session.player_id) is not session:
                         continue
-                else:
-                    session.snapshot_skip = 0
-                bucket = self._interest_bucket(snapshot_data, session.player_id)
-                if bucket not in area_cache:
-                    floor, cell_x, cell_y, inside = bucket
-                    center_x = cell_x * self.tuning.network.grid_cell_size + self.tuning.network.grid_cell_size * 0.5
-                    center_y = cell_y * self.tuning.network.grid_cell_size + self.tuning.network.grid_cell_size * 0.5
-                    area_cache[bucket] = filter_snapshot_area(
-                        snapshot_data,
-                        index,
-                        center_x,
-                        center_y,
-                        floor,
-                        inside or None,
-                        self.tuning.network.interest_radius + self.tuning.network.grid_cell_size * 0.75,
-                        self.tuning.network.building_interest_radius + self.tuning.network.grid_cell_size * 0.75,
-                    )
-                filtered = snapshot_with_local_player(area_cache[bucket], snapshot_data, session.player_id)
-                self._queue_snapshot(session, filtered, snapshot.tick)
-                visible_events = filter_events_for_snapshot(events, filtered, session.player_id)
-                if visible_events:
-                    self._queue_events(session, snapshot.tick, float(snapshot_data.get("time", 0.0)), visible_events)
-            elapsed = time.perf_counter() - started
+                    if snapshot.tick <= session.last_snapshot_tick:
+                        continue
+                    session.snapshot_stride = self._adaptive_snapshot_stride(session)
+                    if session.snapshot_stride > 1:
+                        session.snapshot_skip = (session.snapshot_skip + 1) % session.snapshot_stride
+                        if session.snapshot_skip:
+                            continue
+                    else:
+                        session.snapshot_skip = 0
+                    if self._skip_snapshot_for_backpressure(session):
+                        continue
+                    bucket = self._interest_bucket(snapshot_data, session.player_id)
+                    if bucket not in area_cache:
+                        floor, cell_x, cell_y, inside = bucket
+                        center_x = cell_x * self.tuning.network.grid_cell_size + self.tuning.network.grid_cell_size * 0.5
+                        center_y = cell_y * self.tuning.network.grid_cell_size + self.tuning.network.grid_cell_size * 0.5
+                        area_cache[bucket] = filter_snapshot_area(
+                            snapshot_data,
+                            index,
+                            center_x,
+                            center_y,
+                            floor,
+                            inside or None,
+                            self.tuning.network.interest_radius + self.tuning.network.grid_cell_size * 0.75,
+                            self.tuning.network.building_interest_radius + self.tuning.network.grid_cell_size * 0.75,
+                        )
+                    filtered = snapshot_with_local_player(area_cache[bucket], snapshot_data, session.player_id)
+                    self._queue_snapshot(session, filtered, snapshot.tick)
+                    visible_events = filter_events_for_snapshot(events, filtered, session.player_id)
+                    if visible_events:
+                        self._queue_events(session, snapshot.tick, float(snapshot_data.get("time", 0.0)), visible_events)
+                self.metrics.observe_stage("interest_filter_ms", time.perf_counter() - interest_started)
+                if batch_index + 1 < len(batches):
+                    batch_deadline = round_started + (batch_index + 1) * batch_spacing
+                    sleep_for = max(0.0, batch_deadline - loop.time())
+                    if sleep_for > 0.0:
+                        sleep_started = time.perf_counter()
+                        await asyncio.sleep(sleep_for)
+                        sleeping_seconds += time.perf_counter() - sleep_started
+            elapsed = max(0.0, time.perf_counter() - started - sleeping_seconds)
             self.metrics.observe_snapshot(elapsed)
             self.profiler.record("snapshot_loop", elapsed)
 
     async def _command_result_loop(self) -> None:
         while True:
-            await asyncio.sleep(0.01)
+            await asyncio.sleep(0.002)
             for result in self.simulation.drain_command_results():
                 self.journal.append_command_result(result)
                 self.metrics.observe_command_ack(result.get("server_command_latency_ms"))
@@ -1034,8 +1144,8 @@ class GameServer:
                 self.persistence.record_session("resume_expired", player_id=player_id, name=ticket.name)
                 self.log_worker.info(f"resume expired: {ticket.name} ({player_id})")
 
-    def _filter_snapshot(self, snapshot: dict[str, Any], player_id: str) -> dict[str, Any]:
-        index = SnapshotInterestIndex(snapshot, self.tuning.network.grid_cell_size)
+    def _filter_snapshot(self, snapshot: dict[str, Any], player_id: str, tick: int | None = None) -> dict[str, Any]:
+        index = self._interest_index(snapshot, tick)
         floor, cell_x, cell_y, inside = self._interest_bucket(snapshot, player_id)
         center_x = cell_x * self.tuning.network.grid_cell_size + self.tuning.network.grid_cell_size * 0.5
         center_y = cell_y * self.tuning.network.grid_cell_size + self.tuning.network.grid_cell_size * 0.5
@@ -1050,6 +1160,35 @@ class GameServer:
             self.tuning.network.building_interest_radius + self.tuning.network.grid_cell_size * 0.75,
         )
         return snapshot_with_local_player(area, snapshot, player_id)
+
+    def _bootstrap_snapshot(self, snapshot: dict[str, Any], player_id: str) -> dict[str, Any]:
+        players = snapshot.get("players", {})
+        local = players.get(player_id) if isinstance(players, dict) else None
+        if not isinstance(local, dict):
+            return self._filter_snapshot(snapshot, player_id)
+        boot: dict[str, Any] = {
+            "time": snapshot.get("time", 0.0),
+            "map_width": snapshot.get("map_width", 1),
+            "map_height": snapshot.get("map_height", 1),
+            "players": {player_id: local},
+            "buildings": {},
+        }
+        for collection in POSITION_COLLECTIONS:
+            boot[collection] = {}
+        return boot
+
+    def _interest_index(self, snapshot: dict[str, Any], tick: int | None) -> SnapshotInterestIndex:
+        key = self._interest_index_key(snapshot, tick)
+        if self._interest_index_cache_key == key and self._interest_index_cache is not None:
+            return self._interest_index_cache
+        index = SnapshotInterestIndex(snapshot, self.tuning.network.grid_cell_size)
+        self._interest_index_cache_key = key
+        self._interest_index_cache = index
+        return index
+
+    def _interest_index_key(self, snapshot: dict[str, Any], tick: int | None) -> tuple[Any, ...]:
+        counts = tuple(len(_snapshot_collection(snapshot, collection)) for collection in POSITION_COLLECTIONS)
+        return (tick, self.tuning.network.grid_cell_size, counts)
 
     def _snapshot_with_network_stats(self, snapshot: dict[str, Any]) -> dict[str, Any]:
         players = snapshot.get("players")
@@ -1091,12 +1230,82 @@ class GameServer:
         )
 
     def _adaptive_snapshot_stride(self, session: ClientSession) -> int:
-        queue_pressure = len(session.outbox) / max(1, self.tuning.network.output_queue_packets)
+        stride = 1
+        queued = len(session.outbox)
+        if queued >= 32:
+            stride = 16
+        elif queued >= 16:
+            stride = 8
+        elif queued >= 8:
+            stride = 4
+        elif queued >= 4:
+            stride = 2
+        queue_pressure = queued / max(1, self.tuning.network.output_queue_packets)
         if queue_pressure >= 0.72:
-            return 4
+            stride = max(stride, 8)
         if queue_pressure >= 0.42:
-            return 2
-        return 1
+            stride = max(stride, 4)
+        if self._is_slow_client(session):
+            stride = max(stride, self.tuning.network.slow_client_snapshot_stride)
+        return stride
+
+    def _effective_snapshot_rate(self) -> int:
+        clients = len(self.clients)
+        network = self.tuning.network
+        if clients >= network.adaptive_snapshot_extreme_clients:
+            rate = max(1, min(self.snapshot_rate, network.adaptive_snapshot_extreme_rate))
+        elif clients >= network.adaptive_snapshot_high_clients:
+            rate = max(1, min(self.snapshot_rate, network.adaptive_snapshot_high_rate))
+        elif clients >= network.adaptive_snapshot_medium_clients:
+            rate = max(1, min(self.snapshot_rate, network.adaptive_snapshot_medium_rate))
+        else:
+            rate = max(1, self.snapshot_rate)
+        if self._connection_burst_count() >= network.connection_burst_threshold:
+            rate = max(1, min(rate, network.connection_burst_snapshot_rate))
+        return rate
+
+    def note_connection_attempt(self) -> None:
+        now = time.monotonic()
+        self._connection_times.append(now)
+        self._trim_connection_times(now)
+
+    def _connection_burst_count(self) -> int:
+        now = time.monotonic()
+        self._trim_connection_times(now)
+        return len(self._connection_times)
+
+    def _trim_connection_times(self, now: float) -> None:
+        cutoff = now - self.tuning.network.connection_burst_window_seconds
+        while self._connection_times and self._connection_times[0] < cutoff:
+            self._connection_times.popleft()
+
+    def _is_slow_client(self, session: ClientSession) -> bool:
+        return session.slow_until > time.monotonic()
+
+    def _mark_slow_client(self, session: ClientSession) -> None:
+        session.slow_until = max(
+            session.slow_until,
+            time.monotonic() + self.tuning.network.slow_client_recovery_seconds,
+        )
+
+    def _skip_snapshot_for_backpressure(self, session: ClientSession) -> bool:
+        if not session.outbox.full:
+            return False
+        self._mark_slow_client(session)
+        session.last_snapshot = None
+        session.dropped_snapshots += 1
+        self.metrics.skipped_snapshots_total += 1
+        return True
+
+    def _snapshot_batches(self) -> list[list[ClientSession]]:
+        sessions = list(self.clients.values())
+        if not sessions:
+            return []
+        batch_size = min(len(sessions), max(1, self.tuning.network.snapshot_send_batch_size))
+        start = self._snapshot_cursor % len(sessions)
+        ordered = sessions[start:] + sessions[:start]
+        self._snapshot_cursor = (start + 1) % len(sessions)
+        return [ordered[index : index + batch_size] for index in range(0, len(ordered), batch_size)]
 
     def _queue_control(self, session: ClientSession, message_type: str, **payload: Any) -> None:
         try:
@@ -1112,53 +1321,77 @@ class GameServer:
             self.log_worker.info(f"closing slow client {session.player_id}: output queue is full")
             session.protocol.close()
 
+    def _remember_snapshot_hash(self, session: ClientSession, tick: int, snapshot: dict[str, Any], *, force: bool = False) -> None:
+        interval_ticks = max(1, int(self.tick_rate * self.tuning.network.state_hash_sample_seconds))
+        if force or session.last_hash_tick < 0 or tick - session.last_hash_tick >= interval_ticks:
+            session.snapshot_hashes.append((tick, snapshot_hash(snapshot)))
+            session.last_hash_tick = tick
+
     def _queue_snapshot(self, session: ClientSession, snapshot: dict[str, Any], tick: int) -> None:
-        dropped = session.outbox.make_room_for_snapshot()
-        if dropped:
+        max_pending = self.tuning.network.max_pending_snapshots_per_client
+        trimmed = 0
+        if session.outbox.pending_snapshots() >= max_pending:
+            trimmed = session.outbox.trim_snapshots(0)
+        if trimmed:
             session.last_snapshot = None
-            session.dropped_snapshots += 1
-            self.metrics.dropped_snapshots_total += 1
+            session.dropped_snapshots += trimmed
+            self.metrics.dropped_snapshots_total += trimmed
         if session.outbox.full:
+            self._mark_slow_client(session)
             session.last_snapshot = None
             session.dropped_snapshots += 1
             self.metrics.dropped_snapshots_total += 1
+            self.metrics.skipped_snapshots_total += 1
             return
 
-        full_interval = max(1, int(self.tuning.network.full_snapshot_interval_seconds * self.snapshot_rate))
+        snapshot_rate = max(1, self._current_snapshot_rate)
+        full_interval = max(1, int(self.tuning.network.full_snapshot_interval_seconds * snapshot_rate))
         force_full = session.last_snapshot is None or session.snapshots_since_full >= full_interval
         session.sequence += 1
         if force_full:
+            encode_started = time.perf_counter()
             payload = encode_message(
                 "snapshot",
                 tick=tick,
                 seq=session.sequence,
                 ack_input_seq=self.simulation.ack_input_seq(session.player_id),
                 server_time=float(snapshot.get("time", 0.0)),
-                snapshot_interval=session.snapshot_stride / self.snapshot_rate,
+                snapshot_interval=session.snapshot_stride / snapshot_rate,
                 full=True,
                 schema=SNAPSHOT_SCHEMA,
                 snapshot=compact_snapshot(snapshot, session.player_id),
             )
+            self.metrics.observe_stage("compact_encode_ms", time.perf_counter() - encode_started)
             session.snapshots_since_full = 0
         else:
+            delta_started = time.perf_counter()
             delta = make_snapshot_delta(snapshot, session.last_snapshot)
+            self.metrics.observe_stage("delta_build_ms", time.perf_counter() - delta_started)
+            encode_started = time.perf_counter()
             payload = encode_message(
                 "snapshot",
                 tick=tick,
                 seq=session.sequence,
                 ack_input_seq=self.simulation.ack_input_seq(session.player_id),
                 server_time=float(snapshot.get("time", 0.0)),
-                snapshot_interval=session.snapshot_stride / self.snapshot_rate,
+                snapshot_interval=session.snapshot_stride / snapshot_rate,
                 full=False,
                 base_tick=session.last_snapshot_tick,
                 schema=SNAPSHOT_SCHEMA,
-                delta=compact_delta(delta, session.player_id),
+                delta=compact_delta(delta, session.player_id, session.last_snapshot),
             )
+            self.metrics.observe_stage("compact_encode_ms", time.perf_counter() - encode_started)
             session.snapshots_since_full += 1
-        if session.outbox.put(OutboundPacket(payload, kind="snapshot")):
-            session.last_snapshot = snapshot
-            session.last_snapshot_tick = tick
-            session.snapshot_hashes.append((tick, snapshot_hash(snapshot)))
+        dropped_pending = session.outbox.replace_snapshot(
+            OutboundPacket(payload, kind="snapshot"),
+            max_pending,
+        )
+        if dropped_pending:
+            session.dropped_snapshots += dropped_pending
+            self.metrics.dropped_snapshots_total += dropped_pending
+        session.last_snapshot = snapshot
+        session.last_snapshot_tick = tick
+        self._remember_snapshot_hash(session, tick, snapshot)
 
     def _queue_events(
         self,
@@ -1242,8 +1475,11 @@ class GameServer:
             "connected_players": len(self.clients),
             "resume_tickets": len(self.resume_tickets),
             "output_queue_packets": sum(len(session.outbox) for session in self.clients.values()),
+            "slow_clients": sum(1 for session in self.clients.values() if self._is_slow_client(session)),
+            "connection_burst_count": self._connection_burst_count(),
             "persistence_queue_size": self.persistence.queue_size,
             "asyncio_tasks": len(asyncio.all_tasks()),
+            "effective_snapshot_rate": self._current_snapshot_rate,
         }
 
     def _metrics_text(self) -> str:
@@ -1273,6 +1509,10 @@ class GameServer:
             "max_players": self.tuning.network.max_clients,
             "tick_rate": self.tick_rate,
             "snapshot_rate": self.snapshot_rate,
+            "effective_snapshot_rate": self._current_snapshot_rate,
+            "mode": self.server_mode,
+            "pvp": self.pvp,
+            "zombies": self.simulation.zombie_count(),
         }
 
     async def _profile_loop(self) -> None:
@@ -1298,3 +1538,8 @@ def _connection_quality(ping_ms: int, silence_seconds: float) -> str:
     if ping_ms >= 350:
         return "unstable"
     return "stable"
+
+
+def _snapshot_collection(snapshot: dict[str, Any], key: str) -> dict[str, Any]:
+    value = snapshot.get(key, {})
+    return value if isinstance(value, dict) else {}

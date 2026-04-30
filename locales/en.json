@@ -23,6 +23,8 @@
   "servers.ready": "ready",
   "servers.not_ready": "not ready",
   "servers.offline": "offline",
+  "servers.mode.pvp": "PVP",
+  "servers.mode.survival": "PVE",
   "online.server_shutdown": "Server is shutting down",
   "settings.title": "Visual Settings",
   "settings.pause": "Pause",

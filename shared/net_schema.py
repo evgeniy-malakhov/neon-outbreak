@@ -68,7 +68,11 @@ def expand_snapshot(payload: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def compact_delta(delta: dict[str, Any], local_player_id: str | None) -> dict[str, Any]:
+def compact_delta(
+    delta: dict[str, Any],
+    local_player_id: str | None,
+    previous_snapshot: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     compact: dict[str, Any] = {"v": 1}
     if "time" in delta:
         compact["t"] = delta["time"]
@@ -83,12 +87,20 @@ def compact_delta(delta: dict[str, Any], local_player_id: str | None) -> dict[st
         upserts = _collection(patch, "u")
         removals = list(patch.get("r", []))
         if collection == "players":
-            full_players = {
-                entity_id: entity
-                for entity_id, entity in upserts.items()
-                if entity_id == local_player_id or _is_full_player(entity)
-            }
-            rows = [_pack_player(entity) for entity_id, entity in upserts.items() if entity_id not in full_players]
+            previous_players = _collection(previous_snapshot or {}, "players")
+            full_players: dict[str, Any] = {}
+            rows: list[list[Any]] = []
+            for entity_id, entity in upserts.items():
+                if entity_id == local_player_id:
+                    previous = previous_players.get(entity_id)
+                    if _requires_full_local_player(entity, previous):
+                        full_players[entity_id] = entity
+                    else:
+                        rows.append(_pack_player(entity))
+                elif _is_full_player(entity):
+                    full_players[entity_id] = entity
+                else:
+                    rows.append(_pack_player(entity))
             compact_patch: dict[str, Any] = {"u": rows, "r": removals}
             if full_players:
                 compact_patch["f"] = full_players
@@ -434,6 +446,25 @@ def _active_weapon_payload(entity: dict[str, Any]) -> dict[str, Any] | None:
 
 def _is_full_player(entity: dict[str, Any]) -> bool:
     return any(key in entity for key in ("backpack", "equipment", "quick_items", "owned_armors", "medkits"))
+
+
+def _requires_full_local_player(entity: dict[str, Any], previous: Any) -> bool:
+    if not isinstance(previous, dict):
+        return True
+    for key in ("backpack", "equipment", "quick_items", "owned_armors", "medkits"):
+        if entity.get(key) != previous.get(key):
+            return True
+    current_weapons = _collection(entity, "weapons")
+    previous_weapons = _collection(previous, "weapons")
+    if set(current_weapons) != set(previous_weapons):
+        return True
+    active_slot = str(entity.get("active_slot", "1"))
+    for slot, weapon in current_weapons.items():
+        if str(slot) == active_slot:
+            continue
+        if previous_weapons.get(slot) != weapon:
+            return True
+    return False
 
 
 def _collection(data: dict[str, Any], key: str) -> dict[str, Any]:

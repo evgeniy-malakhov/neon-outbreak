@@ -30,6 +30,9 @@ from shared.constants import (
     ZOMBIES,
 )
 from shared.backpack_config import BackpackConfig, load_backpack_config
+from shared.collision import blocked_at as walls_blocked_at
+from shared.collision import move_circle_against_rects
+from shared.collision import segment_rect_intersects
 from shared.crafting import roll_crafted_rarity
 from shared.difficulty import DifficultyConfig, load_difficulty
 from shared.explosives import GRENADE_SPECS, MINE_SPECS, DEFAULT_GRENADE, DEFAULT_MINE
@@ -125,15 +128,18 @@ class GameWorld:
         self._closed_walls_cache: dict[int, tuple[int, tuple[RectState, ...]]] = {}
         self._zombie_rngs: dict[str, random.Random] = {}
         cpu_budget = max(1, (os.cpu_count() or 4) - 1)
-        worker_count = zombie_workers if zombie_workers is not None else min(12, cpu_budget, self.max_zombies)
-        self._zombie_executor = ThreadPoolExecutor(
-            max_workers=max(1, worker_count),
-            thread_name_prefix="zombie-ai",
-        )
+        worker_count = 0 if self.max_zombies <= 0 else zombie_workers if zombie_workers is not None else min(12, cpu_budget, self.max_zombies)
+        self._zombie_executor: ThreadPoolExecutor | None = None
+        if worker_count > 0:
+            self._zombie_executor = ThreadPoolExecutor(
+                max_workers=max(1, worker_count),
+                thread_name_prefix="zombie-ai",
+            )
         self._prime_map()
 
     def close(self) -> None:
-        self._zombie_executor.shutdown(wait=False, cancel_futures=True)
+        if self._zombie_executor:
+            self._zombie_executor.shutdown(wait=False, cancel_futures=True)
 
     def _id(self, prefix: str) -> str:
         value = f"{prefix}{self._next_id}"
@@ -597,12 +603,20 @@ class GameWorld:
     def _update_zombies(self, dt: float) -> None:
         living_players = tuple(player for player in self.players.values() if player.alive)
         zombies = list(self.zombies.values())
+        if not zombies:
+            return
         active_ids = {zombie.id for zombie in zombies}
         for zombie_id in list(self._zombie_rngs):
             if zombie_id not in active_ids:
                 self._zombie_rngs.pop(zombie_id, None)
 
         if len(zombies) < 2:
+            for zombie in zombies:
+                result = self._update_zombie_actor(zombie, dt, living_players, self._zombie_rng(zombie.id), clone=False)
+                self._apply_zombie_result(result)
+            return
+
+        if not self._zombie_executor:
             for zombie in zombies:
                 result = self._update_zombie_actor(zombie, dt, living_players, self._zombie_rng(zombie.id), clone=False)
                 self._apply_zombie_result(result)
@@ -1842,14 +1856,7 @@ class GameWorld:
         return Vec2(40, self.rng.uniform(0, MAP_HEIGHT))
 
     def _move_circle(self, pos: Vec2, delta: Vec2, radius: float, floor: int) -> None:
-        if delta.x:
-            pos.x += delta.x
-            if self._blocked_at(pos, radius, floor):
-                pos.x -= delta.x
-        if delta.y:
-            pos.y += delta.y
-            if self._blocked_at(pos, radius, floor):
-                pos.y -= delta.y
+        move_circle_against_rects(pos, delta, radius, self._closed_walls(floor))
 
     def _mark_geometry_dirty(self) -> None:
         with self._geometry_cache_lock:
@@ -1869,14 +1876,11 @@ class GameWorld:
             return walls
 
     def _blocked_at(self, pos: Vec2, radius: float, floor: int = 0) -> bool:
-        for wall in self._closed_walls(floor):
-            if _circle_rect_intersects(pos, radius, wall):
-                return True
-        return False
+        return walls_blocked_at(pos, radius, self._closed_walls(floor))
 
     def _line_blocked(self, start: Vec2, end: Vec2, floor: int, sound: bool = False) -> bool:
         for wall in self._closed_walls(floor):
-            if _segment_rect_intersects(start, end, wall):
+            if segment_rect_intersects(start, end, wall):
                 if sound and wall.w < 28 and wall.h < 90:
                     continue
                 return True
@@ -1910,49 +1914,3 @@ def _angle_delta(a: float, b: float) -> float:
 
 def _clean_player_name(name: str) -> str:
     return "Operator" if not name.strip() else name.strip()[:18]
-
-
-def _circle_rect_intersects(pos: Vec2, radius: float, rect: RectState) -> bool:
-    closest_x = max(rect.x, min(pos.x, rect.x + rect.w))
-    closest_y = max(rect.y, min(pos.y, rect.y + rect.h))
-    dx = closest_x - pos.x
-    dy = closest_y - pos.y
-    return dx * dx + dy * dy <= radius * radius
-
-
-def _segment_rect_intersects(start: Vec2, end: Vec2, rect: RectState) -> bool:
-    min_x = min(start.x, end.x)
-    max_x = max(start.x, end.x)
-    min_y = min(start.y, end.y)
-    max_y = max(start.y, end.y)
-    if max_x < rect.x or min_x > rect.x + rect.w or max_y < rect.y or min_y > rect.y + rect.h:
-        return False
-    if rect.contains(start) or rect.contains(end):
-        return True
-
-    dx = end.x - start.x
-    dy = end.y - start.y
-    t0 = 0.0
-    t1 = 1.0
-    for p, q in (
-        (-dx, start.x - rect.x),
-        (dx, rect.x + rect.w - start.x),
-        (-dy, start.y - rect.y),
-        (dy, rect.y + rect.h - start.y),
-    ):
-        if abs(p) <= 0.000001:
-            if q < 0.0:
-                return False
-            continue
-        ratio = q / p
-        if p < 0.0:
-            if ratio > t1:
-                return False
-            if ratio > t0:
-                t0 = ratio
-        else:
-            if ratio < t0:
-                return False
-            if ratio < t1:
-                t1 = ratio
-    return True

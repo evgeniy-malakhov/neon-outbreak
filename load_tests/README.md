@@ -1,6 +1,6 @@
 # Server Load Testing
 
-This folder contains a fake-client load runner for the authoritative online server. It is intentionally separate from the Pygame client so tests can run headless and scale to hundreds of TCP clients in one process.
+This folder contains a fake-client load runner for the authoritative online server. It is intentionally separate from the Pygame client so tests can run headless. The current playable server profile is tuned around bots plus up to 50 players.
 
 ## What It Simulates
 
@@ -34,9 +34,7 @@ The runner reports:
 
 - `smoke`: 10 clients for a quick validation.
 - `50`: 50 clients.
-- `100`: 100 clients.
-- `300`: 300 clients.
-- `500`: 500 clients.
+- `100`, `300`, `500`: experimental stress profiles for protocol research, not the default gameplay target.
 
 Every profile can be overridden from the command line.
 
@@ -60,10 +58,10 @@ Run 50 clients:
 python -m load_tests.fake_client_runner --profile 50 --host 127.0.0.1 --port 8765
 ```
 
-Run 500 clients and export JSON:
+Run 50 clients and export JSON:
 
 ```powershell
-python -m load_tests.fake_client_runner --profile 500 --json-out load_tests/results/500.json
+python -m load_tests.fake_client_runner --profile 50 --json-out load_tests/results/50.json
 ```
 
 ## Run And Monitor A Server PID
@@ -71,7 +69,7 @@ python -m load_tests.fake_client_runner --profile 500 --json-out load_tests/resu
 If the server is already running and you know its PID:
 
 ```powershell
-python -m load_tests.fake_client_runner --profile 100 --server-pid 12345
+python -m load_tests.fake_client_runner --profile 50 --server-pid 12345
 ```
 
 This enables CPU/RAM sampling for that process when `psutil` is installed.
@@ -92,9 +90,9 @@ This is convenient for repeatable local testing. For production-like graceful sh
 
 ```powershell
 python -m load_tests.fake_client_runner `
-  --profile 100 `
-  --duration 180 `
-  --ramp-up 45 `
+  --profile 50 `
+  --duration 120 `
+  --ramp-up 20 `
   --input-hz 20 `
   --command-rate 10 `
   --disconnect-rate 0.2 `
@@ -117,6 +115,5 @@ Good first indicators:
 Recommended progression:
 
 1. Run `smoke` after protocol changes.
-2. Run `50` and `100` for everyday regression checks.
-3. Run `300` before tuning interest management or AI cost.
-4. Run `500` before changing transport or snapshot schema.
+2. Run `50` for everyday regression checks.
+3. Use `100+` only when deliberately researching transport limits beyond the current gameplay target.

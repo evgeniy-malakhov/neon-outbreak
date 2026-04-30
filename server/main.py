@@ -14,6 +14,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--host", default="127.0.0.1", help="Host/IP to bind.")
     parser.add_argument("--port", default=8765, type=int, help="TCP port to bind.")
     parser.add_argument("--difficulty", default="medium", choices=DIFFICULTY_KEYS, help="World difficulty preset.")
+    parser.add_argument("--mode", default="survival", choices=("survival", "pvp"), help="Server mode. Use pvp to run without zombies.")
+    parser.add_argument("--pvp", action="store_true", help="Shortcut for --mode pvp.")
     parser.add_argument("--profile", action="store_true", help="Print periodic server timing and queue metrics.")
     parser.add_argument("--zombie-workers", type=int, default=None, help="Override the zombie AI worker thread count.")
     parser.add_argument("--no-uvloop", action="store_true", help="Disable uvloop even when it is installed.")
@@ -37,6 +39,7 @@ async def _run_server(args: argparse.Namespace) -> None:
         args.host,
         args.port,
         args.difficulty,
+        pvp=args.pvp or args.mode == "pvp",
         profile=args.profile,
         zombie_workers=args.zombie_workers,
     )

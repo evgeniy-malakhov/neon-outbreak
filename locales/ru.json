@@ -23,6 +23,8 @@
   "servers.ready": "готов",
   "servers.not_ready": "не готов",
   "servers.offline": "нет связи",
+  "servers.mode.pvp": "PVP",
+  "servers.mode.survival": "PVE",
   "online.server_shutdown": "Сервер завершает работу",
   "settings.title": "Визуальные настройки",
   "settings.pause": "Пауза",

@@ -38,9 +38,19 @@ class ServerMetrics:
     tick_ms: RollingSeries = field(default_factory=RollingSeries)
     snapshot_ms: RollingSeries = field(default_factory=RollingSeries)
     command_ack_ms: RollingSeries = field(default_factory=RollingSeries)
+    world_update_ms: RollingSeries = field(default_factory=RollingSeries)
+    command_apply_ms: RollingSeries = field(default_factory=RollingSeries)
+    input_apply_ms: RollingSeries = field(default_factory=RollingSeries)
+    snapshot_collect_ms: RollingSeries = field(default_factory=RollingSeries)
+    interest_filter_ms: RollingSeries = field(default_factory=RollingSeries)
+    delta_build_ms: RollingSeries = field(default_factory=RollingSeries)
+    compact_encode_ms: RollingSeries = field(default_factory=RollingSeries)
+    transport_write_ms: RollingSeries = field(default_factory=RollingSeries)
+    outbox_wait_ms: RollingSeries = field(default_factory=RollingSeries)
     commands_rejected_total: int = 0
     reconnect_total: int = 0
     dropped_snapshots_total: int = 0
+    skipped_snapshots_total: int = 0
     bytes_sent_total: int = 0
     bytes_received_total: int = 0
     desync_reports_total: int = 0
@@ -61,6 +71,11 @@ class ServerMetrics:
         if milliseconds is not None:
             self.command_ack_ms.observe(float(milliseconds))
 
+    def observe_stage(self, name: str, seconds: float) -> None:
+        target = getattr(self, name, None)
+        if isinstance(target, RollingSeries):
+            target.observe(seconds * 1000.0)
+
     def prometheus_text(self, runtime: dict[str, Any]) -> str:
         tick = self.tick_ms.summary()
         snapshot = self.snapshot_ms.summary()
@@ -69,6 +84,9 @@ class ServerMetrics:
             "# HELP neon_connected_players Active connected players.",
             "# TYPE neon_connected_players gauge",
             f"neon_connected_players {runtime['connected_players']}",
+            "# HELP neon_effective_snapshot_rate Current adaptive snapshot send rate.",
+            "# TYPE neon_effective_snapshot_rate gauge",
+            f"neon_effective_snapshot_rate {runtime.get('effective_snapshot_rate', 0)}",
             "# HELP neon_tick_ms Server simulation tick duration in milliseconds.",
             "# TYPE neon_tick_ms summary",
             *_summary_lines("neon_tick_ms", tick),
@@ -96,6 +114,15 @@ class ServerMetrics:
             f"neon_command_ack_ms_p95 {float(command_ack['p95']):.6f}",
             "# TYPE neon_command_ack_ms_p99 gauge",
             f"neon_command_ack_ms_p99 {float(command_ack['p99']):.6f}",
+            *_stage_metric_lines("neon_world_update_ms", "World update duration in milliseconds.", self.world_update_ms.summary()),
+            *_stage_metric_lines("neon_command_apply_ms", "Pending command apply duration in milliseconds.", self.command_apply_ms.summary()),
+            *_stage_metric_lines("neon_input_apply_ms", "Pending movement input apply duration in milliseconds.", self.input_apply_ms.summary()),
+            *_stage_metric_lines("neon_snapshot_collect_ms", "Authoritative world snapshot collection duration in milliseconds.", self.snapshot_collect_ms.summary()),
+            *_stage_metric_lines("neon_interest_filter_ms", "Interest filtering and per-client snapshot preparation duration in milliseconds.", self.interest_filter_ms.summary()),
+            *_stage_metric_lines("neon_delta_build_ms", "Delta snapshot build duration in milliseconds.", self.delta_build_ms.summary()),
+            *_stage_metric_lines("neon_compact_encode_ms", "Compact schema packing and frame encoding duration in milliseconds.", self.compact_encode_ms.summary()),
+            *_stage_metric_lines("neon_transport_write_ms", "Asyncio transport write/backpressure duration in milliseconds.", self.transport_write_ms.summary()),
+            *_stage_metric_lines("neon_outbox_wait_ms", "Time packets spent waiting in per-client output queues in milliseconds.", self.outbox_wait_ms.summary()),
             "# HELP neon_commands_rejected_total Rejected reliable commands.",
             "# TYPE neon_commands_rejected_total counter",
             f"neon_commands_rejected_total {self.commands_rejected_total}",
@@ -105,6 +132,9 @@ class ServerMetrics:
             "# HELP neon_dropped_snapshots_total Snapshot packets dropped from slow client queues.",
             "# TYPE neon_dropped_snapshots_total counter",
             f"neon_dropped_snapshots_total {self.dropped_snapshots_total}",
+            "# HELP neon_skipped_snapshots_total Snapshot builds skipped because a client was already backpressured.",
+            "# TYPE neon_skipped_snapshots_total counter",
+            f"neon_skipped_snapshots_total {self.skipped_snapshots_total}",
             "# HELP neon_bytes_sent_total Bytes written by the game protocol.",
             "# TYPE neon_bytes_sent_total counter",
             f"neon_bytes_sent_total {self.bytes_sent_total}",
@@ -135,6 +165,12 @@ class ServerMetrics:
             "# HELP neon_output_queue_packets Queued outbound packets across all clients.",
             "# TYPE neon_output_queue_packets gauge",
             f"neon_output_queue_packets {runtime['output_queue_packets']}",
+            "# HELP neon_slow_clients Clients currently snapshot-throttled because of outbound backpressure.",
+            "# TYPE neon_slow_clients gauge",
+            f"neon_slow_clients {runtime.get('slow_clients', 0)}",
+            "# HELP neon_connection_burst_count Accepted TCP connections in the current burst window.",
+            "# TYPE neon_connection_burst_count gauge",
+            f"neon_connection_burst_count {runtime.get('connection_burst_count', 0)}",
             "# HELP neon_persistence_queue_size Pending persistence records.",
             "# TYPE neon_persistence_queue_size gauge",
             f"neon_persistence_queue_size {runtime['persistence_queue_size']}",
@@ -174,6 +210,20 @@ def _summary_lines(name: str, summary: dict[str, float | int]) -> list[str]:
         f'{name}{{quantile="p95"}} {float(summary["p95"]):.6f}',
         f'{name}{{quantile="p99"}} {float(summary["p99"]):.6f}',
         f"{name}_count {int(summary['count'])}",
+    ]
+
+
+def _stage_metric_lines(name: str, help_text: str, summary: dict[str, float | int]) -> list[str]:
+    return [
+        f"# HELP {name} {help_text}",
+        f"# TYPE {name} summary",
+        *_summary_lines(name, summary),
+        f"# TYPE {name}_avg gauge",
+        f"{name}_avg {float(summary['avg']):.6f}",
+        f"# TYPE {name}_p95 gauge",
+        f"{name}_p95 {float(summary['p95']):.6f}",
+        f"# TYPE {name}_p99 gauge",
+        f"{name}_p99 {float(summary['p99']):.6f}",
     ]
 
 

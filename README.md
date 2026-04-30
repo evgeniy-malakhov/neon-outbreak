@@ -57,6 +57,12 @@ Start the server in a separate terminal:
 python -m server.main --host 127.0.0.1 --port 8765 --difficulty medium
 ```
 
+Run a PvP-only server without zombies:
+
+```bash
+python -m server.main --host 127.0.0.1 --port 8765 --mode pvp
+```
+
 For profiling network queues and snapshot timings:
 
 ```powershell
@@ -79,9 +85,11 @@ Servers are configured in [servers.json](servers.json). Add more entries like th
 ]
 ```
 
-Server difficulty can be `easy`, `medium`, `hard` or `insane`. In online mode the server owns the world balance.
+Server difficulty can be `easy`, `medium`, `hard` or `insane`. In online mode the server owns the world balance. The default server profile is tuned for very smooth 1-10 player sessions and a hard cap of 50 players; PvP servers advertise themselves in the server list and run without zombie AI.
 
 Server networking is configured in `configs/server.json`. The current online protocol uses optimized TCP frames with compact snapshot schema `compact-v1`. UDP is exposed as a reserved launch option for future protocol work, but the playable server currently runs on TCP.
+
+For online tests, the server defaults are tuned for stability: 30 TPS, 24 snapshot cycles per second for small 1-15 player matches, 20 Hz around 16-32 players, 15 Hz around 33-44 players, and 12 Hz near the 50-player cap. The server uses time-sliced batched snapshot delivery, slow-client snapshot throttling and at most one pending realtime snapshot per client. The Pygame online client predicts local movement every rendered frame and throttles unchanged network input to reduce spam.
 
 The server also exposes HTTP observability endpoints from `configs/server.json -> observability`:
 
@@ -97,7 +105,7 @@ Run headless fake clients against the server:
 python -m load_tests.fake_client_runner --profile smoke --host 127.0.0.1 --port 8765
 ```
 
-Profiles `50`, `100`, `300` and `500` are defined in `load_tests/profiles.json`. Full instructions and metric explanations are in [load_tests/README.md](load_tests/README.md).
+Profile `50` is the primary regression target for this server profile. Larger load-test profiles still exist for experiments, but the playable server is balanced around bots plus up to 50 players. Full instructions and metric explanations are in [load_tests/README.md](load_tests/README.md).
 
 ## Controls
 
