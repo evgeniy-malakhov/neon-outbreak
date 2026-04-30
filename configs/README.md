@@ -14,6 +14,7 @@ All files in this folder are UTF-8 JSON, except this documentation file. Restart
 - `backpack.json` configures the starting backpack.
 - `item_stacks.json` configures stack sizes for backpack items.
 - `icon_mapping.json` maps game ids to PNG filenames in `images/`.
+- `death_effects.json` configures client-side corpse, blood spread and fade timings.
 - `server.json` configures server networking, interest management, output queues and profiling thresholds.
 - `difficulty/*.json` configures world difficulty presets.
 
@@ -144,6 +145,21 @@ Fields:
 - `armor_durability_multiplier`: divides armor wear.
 
 Higher rarity weapons and armor are shown with their rarity color on the map and in inventory UI.
+
+## Death effects
+
+`death_effects.json` controls visual-only death effects. These effects are not physics entities: bullets, players and zombies ignore corpses and blood.
+
+- `corpse_seconds`: how long a zombie corpse or fresh player death marker remains visible.
+- `corpse_fade_seconds`: how long the final fade-out lasts.
+- `blood_seconds`: how long the blood pool remains visible.
+- `blood_spread_seconds`: how long the blood pool keeps expanding.
+- `blood_fade_seconds`: how long the final blood fade-out lasts.
+- `blood_start_radius` / `blood_end_radius`: world-space radius range for the spreading blood pool.
+- `blood_alpha`: maximum blood opacity.
+- `corpse_dark_alpha`: darkness applied over dead zombie bodies.
+- `player_cross_size` / `player_cross_width`: black cross size and stroke width for dead players.
+- `max_effects`: maximum number of active local death effects kept by the client.
 
 ## Explosives
 

@@ -9,6 +9,7 @@ from pathlib import Path
 
 import pygame
 
+from client.death_effects import load_death_effect_tuning
 from client.network import OnlineClient, ping_server
 from client.settings_schema import SETTINGS_TABS, tab_has_camera_distance, tab_has_language, tab_is_stub, tab_toggle_keys
 from client.single_setup_schema import DENSITY_ORDER, MAP_OPTIONS
@@ -131,6 +132,11 @@ class GameApp:
         self._prev_grenade_state: dict[str, tuple[Vec2, int, str]] = {}
         self._prev_mine_state: dict[str, tuple[Vec2, int, str]] = {}
         self._explosion_effects: list[dict[str, object]] = []
+        self._join_notifications: list[dict[str, object]] = []
+        self.death_effects = load_death_effect_tuning()
+        self._death_effects: list[dict[str, object]] = []
+        self._prev_zombie_death_state: dict[str, dict[str, object]] = {}
+        self._prev_player_death_state: dict[str, dict[str, object]] = {}
         self.scoreboard_scroll = 0
         saved_settings = self._load_client_settings()
         self.camera_distance = max(0.78, min(1.08, float(saved_settings.get("camera_distance", 0.92))))
@@ -794,8 +800,168 @@ class GameApp:
             if kind == "server_shutdown":
                 self.online.error = self.tr("online.server_shutdown")
                 continue
-            if kind in {"hit", "player_died"} and event.get("target_id", event.get("player_id")) == self.online.player_id:
+            if kind == "player_joined":
+                if str(event.get("player_id", "")) != str(self.online.player_id or ""):
+                    self._add_join_notification(str(event.get("name") or "Player"))
+                continue
+            if kind == "zombie_killed":
+                self._add_zombie_death_from_event(event)
+                continue
+            if kind == "player_died":
+                self._add_player_death_from_event(event)
+                if event.get("player_id") == self.online.player_id:
+                    self.damage_flash = min(1.0, max(self.damage_flash, 0.35))
+                continue
+            if kind == "hit" and event.get("target_id") == self.online.player_id:
                 self.damage_flash = min(1.0, max(self.damage_flash, 0.35))
+
+    def _add_join_notification(self, name: str) -> None:
+        clean_name = self._clean_player_name(name)
+        self._join_notifications.append(
+            {
+                "name": clean_name,
+                "started": time.time(),
+                "duration": 4.2,
+            }
+        )
+        self._join_notifications = self._join_notifications[-4:]
+
+    def _add_zombie_death_from_event(self, event: dict[str, object]) -> None:
+        entity_id = str(event.get("entity_id") or "")
+        if not entity_id:
+            return
+        kind = str(event.get("entity_kind") or "walker")
+        if kind not in ZOMBIES:
+            kind = "walker"
+        try:
+            pos = Vec2(float(event.get("x", 0.0)), float(event.get("y", 0.0)))
+            floor = int(event.get("floor", 0))
+            facing = float(event.get("facing", 0.0))
+        except (TypeError, ValueError):
+            return
+        self._add_death_effect("zombie", entity_id, pos, floor, kind=kind, facing=facing)
+
+    def _add_player_death_from_event(self, event: dict[str, object]) -> None:
+        player_id = str(event.get("player_id") or "")
+        if not player_id:
+            return
+        snapshot = self._snapshot()
+        player = snapshot.players.get(player_id) if snapshot else None
+        try:
+            x_value = event.get("x", player.pos.x if player else 0.0)
+            y_value = event.get("y", player.pos.y if player else 0.0)
+            pos = Vec2(float(x_value), float(y_value))
+            floor = int(event.get("floor", player.floor if player else 0))
+            facing = float(event.get("angle", player.angle if player else 0.0))
+        except (TypeError, ValueError):
+            return
+        name = str(event.get("name") or (player.name if player else "Player"))
+        self._add_death_effect("player", player_id, pos, floor, name=name, facing=facing)
+
+    def _add_death_effect(
+        self,
+        entity_type: str,
+        entity_id: str,
+        pos: Vec2,
+        floor: int,
+        *,
+        kind: str = "",
+        name: str = "",
+        facing: float = 0.0,
+    ) -> None:
+        now = time.time()
+        self._prune_death_effects(now)
+        key = f"{entity_type}:{entity_id}"
+        if any(str(effect.get("key", "")) == key for effect in self._death_effects):
+            return
+        seed_text = f"{key}:{kind}:{name}"
+        seed = sum((index + 1) * ord(char) for index, char in enumerate(seed_text))
+        self._death_effects.append(
+            {
+                "key": key,
+                "entity_type": entity_type,
+                "entity_id": entity_id,
+                "kind": kind,
+                "name": name,
+                "pos": pos.copy(),
+                "floor": int(floor),
+                "facing": float(facing),
+                "started": now,
+                "seed": seed,
+            }
+        )
+        max_effects = max(1, int(self.death_effects.max_effects))
+        if len(self._death_effects) > max_effects:
+            self._death_effects = self._death_effects[-max_effects:]
+
+    def _update_death_effects(self, snapshot: WorldSnapshot) -> None:
+        now = time.time()
+        current_zombies: dict[str, dict[str, object]] = {
+            zombie.id: {
+                "kind": zombie.kind,
+                "pos": zombie.pos.copy(),
+                "floor": zombie.floor,
+                "facing": zombie.facing,
+            }
+            for zombie in snapshot.zombies.values()
+        }
+        if self.state == "single":
+            for zombie_id, previous in self._prev_zombie_death_state.items():
+                if zombie_id in current_zombies:
+                    continue
+                previous_pos = previous.get("pos")
+                if isinstance(previous_pos, Vec2):
+                    self._add_death_effect(
+                        "zombie",
+                        zombie_id,
+                        previous_pos,
+                        int(previous.get("floor", 0)),
+                        kind=str(previous.get("kind", "walker")),
+                        facing=float(previous.get("facing", 0.0)),
+                    )
+        self._prev_zombie_death_state = current_zombies
+
+        current_players: dict[str, dict[str, object]] = {
+            player.id: {
+                "alive": player.alive,
+                "pos": player.pos.copy(),
+                "floor": player.floor,
+                "name": player.name,
+                "angle": player.angle,
+            }
+            for player in snapshot.players.values()
+        }
+        for player_id, current in current_players.items():
+            previous = self._prev_player_death_state.get(player_id)
+            if current.get("alive", True) or (previous and not previous.get("alive", True)):
+                continue
+            current_pos = current.get("pos")
+            if isinstance(current_pos, Vec2):
+                self._add_death_effect(
+                    "player",
+                    player_id,
+                    current_pos,
+                    int(current.get("floor", 0)),
+                    name=str(current.get("name", "Player")),
+                    facing=float(current.get("angle", 0.0)),
+                )
+        self._prev_player_death_state = current_players
+        self._prune_death_effects(now)
+
+    def _prune_death_effects(self, now: float) -> None:
+        lifetime = max(float(self.death_effects.corpse_seconds), float(self.death_effects.blood_seconds))
+        self._death_effects = [
+            effect for effect in self._death_effects if now - float(effect.get("started", now)) <= lifetime + 0.08
+        ]
+
+    def _has_death_effect(self, entity_type: str, entity_id: str) -> bool:
+        key = f"{entity_type}:{entity_id}"
+        now = time.time()
+        return any(
+            str(effect.get("key", "")) == key
+            and now - float(effect.get("started", now)) <= float(self.death_effects.corpse_seconds)
+            for effect in self._death_effects
+        )
 
     def _update_camera_zoom(self, dt: float) -> None:
         snapshot = self._snapshot()
@@ -918,6 +1084,11 @@ class GameApp:
         self.pending_slot = None
         self.pending_equip_armor = None
 
+    def _reset_death_effect_tracking(self) -> None:
+        self._death_effects.clear()
+        self._prev_zombie_death_state.clear()
+        self._prev_player_death_state.clear()
+
     def _start_single_player(self) -> None:
         self.online.close()
         if self.world:
@@ -943,6 +1114,7 @@ class GameApp:
         self.settings_open = False
         self.craft_open = False
         self.weapon_custom_open = False
+        self._reset_death_effect_tracking()
         self.state = "single"
         self._save_client_settings()
 
@@ -964,6 +1136,7 @@ class GameApp:
             self.inventory_open = False
             self.backpack_open = False
             self.weapon_custom_open = False
+            self._reset_death_effect_tracking()
             self.state = "online_game"
         except OSError as exc:
             entry.status = f"error: {exc}"
@@ -979,6 +1152,7 @@ class GameApp:
         self.settings_open = False
         self.craft_open = False
         self.weapon_custom_open = False
+        self._reset_death_effect_tracking()
 
     def _load_servers(self) -> list[ServerEntry]:
         path = ROOT / "servers.json"
@@ -1258,6 +1432,7 @@ class GameApp:
         self._draw_world_background(camera)
         if snapshot:
             self._update_explosion_effects(snapshot, player)
+            self._update_death_effects(snapshot)
             self._draw_tunnels(snapshot, camera, player)
             self._draw_buildings(snapshot, camera, player)
             if player and self.settings["noise_radius"]:
@@ -1267,8 +1442,10 @@ class GameApp:
             self._draw_grenades(snapshot, camera)
             self._draw_mines(snapshot, camera)
             self._draw_poison(snapshot, camera)
+            self._draw_death_blood_effects(camera, player)
             self._draw_zombies(snapshot, camera)
             self._draw_players(snapshot, camera)
+            self._draw_death_body_effects(camera, player)
             self._draw_weapon_utilities(snapshot, camera, player)
             self._draw_explosion_effects(camera, player)
             if player:
@@ -1276,6 +1453,8 @@ class GameApp:
             if player:
                 self._draw_damage_feedback(player)
             self._draw_hud(snapshot, player)
+            if self.state == "online_game":
+                self._draw_join_notifications()
             self._draw_minimap(snapshot, player)
             if self.state == "online_game":
                 self._draw_connection_status()
@@ -1668,6 +1847,10 @@ class GameApp:
             if local and player.floor != local.floor:
                 continue
             sx, sy = self._world_to_screen(player.pos, camera)
+            if not player.alive:
+                if not self._has_death_effect("player", player.id):
+                    self._draw_dead_player_cross((sx, sy), 1.0, 210)
+                continue
             color = CYAN if player.id == (self.local_player_id or self.online.player_id) else GREEN
             body_radius = self._world_size(24, 12)
             pygame.draw.circle(self.screen, (4, 8, 14), (sx, sy), self._world_size(31, body_radius + 4))
@@ -1677,6 +1860,117 @@ class GameApp:
             muzzle = (int(sx + math.cos(player.angle) * muzzle_len), int(sy + math.sin(player.angle) * muzzle_len))
             pygame.draw.line(self.screen, TEXT, (sx, sy), muzzle, self._world_size(5, 2))
             self._draw_text(player.name, sx - 28, sy - 48, TEXT, self.small)
+
+    def _draw_death_blood_effects(self, camera: Vec2, local: PlayerState | None) -> None:
+        now = time.time()
+        for effect in self._death_effects:
+            if local and int(effect.get("floor", 0)) != local.floor:
+                continue
+            started = float(effect.get("started", now))
+            age = now - started
+            if age < 0.0 or age > float(self.death_effects.blood_seconds):
+                continue
+            pos = effect.get("pos")
+            if not isinstance(pos, Vec2):
+                continue
+            sx, sy = self._world_to_screen(pos, camera)
+            self._draw_blood_pool((sx, sy), effect, age)
+
+    def _draw_death_body_effects(self, camera: Vec2, local: PlayerState | None) -> None:
+        now = time.time()
+        for effect in self._death_effects:
+            if local and int(effect.get("floor", 0)) != local.floor:
+                continue
+            started = float(effect.get("started", now))
+            age = now - started
+            alpha_ratio = self._corpse_alpha_ratio(age)
+            if alpha_ratio <= 0.0:
+                continue
+            pos = effect.get("pos")
+            if not isinstance(pos, Vec2):
+                continue
+            sx, sy = self._world_to_screen(pos, camera)
+            if str(effect.get("entity_type", "")) == "player":
+                self._draw_dead_player_cross((sx, sy), alpha_ratio, int(225 * alpha_ratio))
+            else:
+                self._draw_dead_zombie_body((sx, sy), effect, alpha_ratio)
+
+    def _draw_blood_pool(self, center: tuple[int, int], effect: dict[str, object], age: float) -> None:
+        tuning = self.death_effects
+        spread = min(1.0, age / max(0.01, float(tuning.blood_spread_seconds)))
+        spread = spread * spread * (3.0 - 2.0 * spread)
+        fade_start = max(0.01, float(tuning.blood_seconds) - float(tuning.blood_fade_seconds))
+        fade = 1.0 if age <= fade_start else max(0.0, (float(tuning.blood_seconds) - age) / max(0.01, float(tuning.blood_fade_seconds)))
+        alpha = int(float(tuning.blood_alpha) * fade)
+        if alpha <= 0:
+            return
+        radius_world = float(tuning.blood_start_radius) + (float(tuning.blood_end_radius) - float(tuning.blood_start_radius)) * spread
+        radius = self._world_size(radius_world, 8)
+        size = radius * 2 + 34
+        surface = pygame.Surface((size, size), pygame.SRCALPHA)
+        cx = cy = size // 2
+        seed = int(effect.get("seed", 1))
+        base_rect = pygame.Rect(cx - radius, cy - int(radius * 0.62), radius * 2, max(2, int(radius * 1.24)))
+        pygame.draw.ellipse(surface, (68, 3, 12, int(alpha * 0.64)), base_rect)
+        pygame.draw.ellipse(surface, (132, 12, 22, int(alpha * 0.68)), base_rect.inflate(-int(radius * 0.3), -int(radius * 0.2)))
+        for index in range(7):
+            wave = 0.5 + 0.5 * math.sin(seed * 0.037 + index * 2.17)
+            angle = seed * 0.011 + index * 0.93
+            distance = radius * (0.14 + 0.22 * wave) * spread
+            lobe_radius = max(3, int(radius * (0.16 + 0.14 * (1.0 - wave))))
+            lx = int(cx + math.cos(angle) * distance)
+            ly = int(cy + math.sin(angle) * distance * 0.72)
+            lobe = pygame.Rect(lx - lobe_radius, ly - int(lobe_radius * 0.65), lobe_radius * 2, max(2, int(lobe_radius * 1.3)))
+            pygame.draw.ellipse(surface, (114, 4, 18, int(alpha * (0.42 + 0.3 * wave))), lobe)
+        pygame.draw.ellipse(surface, (218, 32, 38, int(alpha * 0.18)), base_rect.inflate(-int(radius * 0.75), -int(radius * 0.72)))
+        self.screen.blit(surface, (center[0] - cx, center[1] - cy))
+
+    def _draw_dead_zombie_body(self, center: tuple[int, int], effect: dict[str, object], alpha_ratio: float) -> None:
+        kind = str(effect.get("kind", "walker"))
+        spec = ZOMBIES.get(kind, ZOMBIES["walker"])
+        radius = self._world_size(spec.radius, 8)
+        size = radius * 3 + 28
+        surface = pygame.Surface((size, size), pygame.SRCALPHA)
+        cx = cy = size // 2
+        alpha = int(255 * alpha_ratio)
+        dark_alpha = int(float(self.death_effects.corpse_dark_alpha) * alpha_ratio)
+        outline_alpha = int(float(self.death_effects.corpse_outline_alpha) * alpha_ratio)
+        pygame.draw.ellipse(
+            surface,
+            (0, 0, 0, int(86 * alpha_ratio)),
+            pygame.Rect(cx - radius - 8, cy - int(radius * 0.62), radius * 2 + 16, int(radius * 1.24)),
+        )
+        pygame.draw.circle(surface, (*spec.color, int(96 * alpha_ratio)), (cx, cy), radius)
+        pygame.draw.circle(surface, (2, 4, 8, dark_alpha), (cx, cy), radius)
+        pygame.draw.circle(surface, (0, 0, 0, outline_alpha), (cx, cy), radius, max(1, self._world_size(3, 1)))
+        facing = float(effect.get("facing", 0.0))
+        nose = (int(cx + math.cos(facing) * radius * 0.78), int(cy + math.sin(facing) * radius * 0.78))
+        pygame.draw.line(surface, (18, 0, 4, alpha), (cx, cy), nose, max(2, self._world_size(5, 2)))
+        self.screen.blit(surface, (center[0] - cx, center[1] - cy))
+
+    def _draw_dead_player_cross(self, center: tuple[int, int], alpha_ratio: float, alpha: int) -> None:
+        size = self._world_size(float(self.death_effects.player_cross_size), 18)
+        width = self._world_size(float(self.death_effects.player_cross_width), 3)
+        surface_size = size * 2 + 18
+        surface = pygame.Surface((surface_size, surface_size), pygame.SRCALPHA)
+        cx = cy = surface_size // 2
+        shadow_alpha = int(90 * alpha_ratio)
+        pygame.draw.circle(surface, (80, 0, 8, shadow_alpha), (cx, cy), max(10, int(size * 0.62)))
+        pygame.draw.line(surface, (10, 10, 14, alpha), (cx - size, cy - size), (cx + size, cy + size), width)
+        pygame.draw.line(surface, (10, 10, 14, alpha), (cx - size, cy + size), (cx + size, cy - size), width)
+        pygame.draw.line(surface, (0, 0, 0, min(255, alpha + 24)), (cx - size, cy - size), (cx + size, cy + size), max(1, width // 2))
+        pygame.draw.line(surface, (0, 0, 0, min(255, alpha + 24)), (cx - size, cy + size), (cx + size, cy - size), max(1, width // 2))
+        self.screen.blit(surface, (center[0] - cx, center[1] - cy))
+
+    def _corpse_alpha_ratio(self, age: float) -> float:
+        lifetime = float(self.death_effects.corpse_seconds)
+        if age < 0.0 or age > lifetime:
+            return 0.0
+        fade_seconds = max(0.01, float(self.death_effects.corpse_fade_seconds))
+        fade_start = max(0.0, lifetime - fade_seconds)
+        if age <= fade_start:
+            return 1.0
+        return max(0.0, (lifetime - age) / fade_seconds)
 
     def _draw_weapon_utilities(self, snapshot: WorldSnapshot, camera: Vec2, local: PlayerState | None) -> None:
         for player in snapshot.players.values():
@@ -1962,6 +2256,63 @@ class GameApp:
         self._draw_text_fit(title, pygame.Rect(rect.x + 88, rect.y + 14, 160, 22), TEXT, self.hud_title_font)
         self._draw_text_fit(subtitle, pygame.Rect(rect.x + 88, rect.y + 38, 120, 18), accent, self.small)
         self._draw_text_fit(ammo, pygame.Rect(rect.right - 86, rect.y + 52, 64, 24), YELLOW if weapon or quick_item else MUTED, self.hud_value_font, center=True)
+
+    def _draw_join_notifications(self) -> None:
+        now = time.time()
+        active: list[dict[str, object]] = []
+        for notification in self._join_notifications:
+            started = float(notification.get("started", now))
+            duration = float(notification.get("duration", 4.2))
+            age = now - started
+            if age < duration:
+                active.append(notification)
+        self._join_notifications = active
+        for index, notification in enumerate(reversed(active[-3:])):
+            started = float(notification.get("started", now))
+            duration = float(notification.get("duration", 4.2))
+            age = max(0.0, now - started)
+            appear = min(1.0, age / 0.38)
+            fade = min(1.0, max(0.0, (duration - age) / 0.95))
+            alpha = int(225 * min(appear, fade))
+            if alpha <= 0:
+                continue
+            pulse = math.sin(age * 8.0) * 0.035
+            scale = 0.92 + 0.13 * appear + pulse * fade
+            rect = pygame.Rect(22, SCREEN_H - 234 - index * 58, 300, 48)
+            slide = int((1.0 - appear) * -34)
+            rect.x += slide
+            surface = pygame.Surface(rect.size, pygame.SRCALPHA)
+            pygame.draw.rect(surface, (9, 14, 26, int(172 * min(appear, fade))), surface.get_rect(), border_radius=11)
+            pygame.draw.rect(surface, (76, 225, 255, int(112 * min(appear, fade))), surface.get_rect(), 1, border_radius=11)
+            self.screen.blit(surface, rect)
+            icon_size = max(24, int(34 * scale))
+            icon = self._scaled_icon("joined", (icon_size, icon_size))
+            icon_center = (rect.x + 31, rect.centery)
+            if icon:
+                icon = icon.copy()
+                icon.set_alpha(alpha)
+                glow = pygame.Surface((54, 54), pygame.SRCALPHA)
+                pygame.draw.circle(glow, (76, 225, 255, int(42 * min(appear, fade))), (27, 27), int(18 * scale))
+                self.screen.blit(glow, (icon_center[0] - 27, icon_center[1] - 27))
+                self.screen.blit(icon, icon.get_rect(center=icon_center))
+            else:
+                pygame.draw.circle(self.screen, (76, 225, 255), icon_center, int(12 * scale))
+            name = str(notification.get("name", "Player"))
+            label = self.tr("online.player_joined", name=name)
+            text_rect = pygame.Rect(rect.x + 58, rect.y + 11, rect.w - 70, 24)
+            text_font = self.emphasis_font
+            for candidate in (self.emphasis_font, self.hud_value_font, self.small):
+                if candidate.size(label)[0] <= text_rect.w:
+                    text_font = candidate
+                    break
+            display_label = label
+            if text_font.size(display_label)[0] > text_rect.w:
+                while len(display_label) > 4 and text_font.size(display_label.rstrip() + "...")[0] > text_rect.w:
+                    display_label = display_label[:-1]
+                display_label = display_label.rstrip() + "..."
+            text = text_font.render(display_label, True, TEXT)
+            text.set_alpha(alpha)
+            self.screen.blit(text, text.get_rect(midleft=(text_rect.x, rect.centery)))
 
     def _mine_tier(self, mine_kind: str) -> int:
         if "heavy" in mine_kind:

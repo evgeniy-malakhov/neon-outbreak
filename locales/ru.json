@@ -32,6 +32,7 @@
   "online.notice.packet_loss": "Потеря пакетов",
   "online.notice.lost": "Соединение потеряно",
   "online.notice.reconnecting": "Переподключение",
+  "online.player_joined": "{name} подключился",
   "settings.title": "Настройки",
   "settings.tab.general": "Общие",
   "settings.tab.video": "Видео",

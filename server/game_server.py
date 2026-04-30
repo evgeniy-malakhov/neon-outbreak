@@ -755,6 +755,7 @@ class GameServer:
             interest_radius=self.tuning.network.interest_radius,
             building_interest_radius=self.tuning.network.building_interest_radius,
         )
+        self._broadcast_player_joined(player.id, name, snapshot.tick, float(snapshot.data.get("time", 0.0)))
         self.log_worker.info(f"player connected: {name} ({player.id})")
         self.persistence.record_session("player_connected", player_id=player.id, name=name)
 
@@ -1414,6 +1415,27 @@ class GameServer:
             events=events,
             channel="reliable",
         )
+
+    def _broadcast_player_joined(self, player_id: str, name: str, tick: int, server_time: float) -> None:
+        event = {
+            "kind": "player_joined",
+            "tick": tick,
+            "server_tick": tick,
+            "time": round(server_time, 3),
+            "player_id": player_id,
+            "name": name,
+        }
+        self.persistence.record_match_event(
+            "domain_event",
+            player_id=player_id,
+            kind="player_joined",
+            tick=tick,
+            payload=event,
+        )
+        for session_id, session in list(self.clients.items()):
+            if session_id == player_id:
+                continue
+            self._queue_events(session, tick, server_time, [event])
 
     def _persist_player_profile(self, player_id: str) -> None:
         profile = self.simulation.player_profile(player_id)

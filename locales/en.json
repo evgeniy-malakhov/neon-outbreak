@@ -32,6 +32,7 @@
   "online.notice.packet_loss": "Packet loss detected",
   "online.notice.lost": "Connection lost",
   "online.notice.reconnecting": "Reconnecting",
+  "online.player_joined": "{name} joined",
   "settings.title": "Settings",
   "settings.tab.general": "General",
   "settings.tab.video": "Video",
