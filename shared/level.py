@@ -66,6 +66,8 @@ def _make_building(building_id: str, name: str, x: float, y: float, w: float, h:
         PropState(f"{building_id}-basement-locker", "cabinet", RectState(x + w - 158, y + h - 238, 88, 138), floor=-1),
         PropState(f"{building_id}-upper-bed", "bed", RectState(x + 82, y + 90, 142, 74), floor=1),
         PropState(f"{building_id}-upper-cabinet", "cabinet", RectState(x + w - 150, y + 100, 86, 126), floor=2),
+        PropState(f"{building_id}-glass-f2", "glass_wall", RectState(x + w * 0.42, y - 6, w * 0.16, WALL + 12), floor=1),
+        PropState(f"{building_id}-glass-f3", "glass_wall", RectState(x + w * 0.42, y - 6, w * 0.16, WALL + 12), floor=2),
         PropState(f"{building_id}-barrel-a", "barrel", RectState(x - 84, y + h * 0.32, 46, 46), floor=0),
         PropState(f"{building_id}-barrel-b", "barrel", RectState(x + w + 42, y + h * 0.60, 48, 48), floor=0),
         PropState(f"{building_id}-pallet", "pallet", RectState(x + w * 0.18, y + h + 44, 126, 54), floor=0),
@@ -88,15 +90,44 @@ def _basement_entry(building: BuildingState) -> Vec2:
 
 
 def tunnel_walls(buildings: dict[str, BuildingState]) -> list[RectState]:
+    tunnels = tunnel_segments(buildings)
+    if not tunnels:
+        return []
+
+    unit = 28.0
+    min_x = min(rect.x for rect in tunnels) - WALL * 2.0
+    min_y = min(rect.y for rect in tunnels) - WALL * 2.0
+    max_x = max(rect.x + rect.w for rect in tunnels) + WALL * 2.0
+    max_y = max(rect.y + rect.h for rect in tunnels) + WALL * 2.0
+    cols = max(1, int((max_x - min_x) / unit) + 2)
+    rows = max(1, int((max_y - min_y) / unit) + 2)
+    occupied = [[False for _ in range(cols)] for _ in range(rows)]
+
+    for row in range(rows):
+        cy = min_y + (row + 0.5) * unit
+        for col in range(cols):
+            cx = min_x + (col + 0.5) * unit
+            for tunnel in tunnels:
+                if tunnel.x <= cx <= tunnel.x + tunnel.w and tunnel.y <= cy <= tunnel.y + tunnel.h:
+                    occupied[row][col] = True
+                    break
+
     walls: list[RectState] = []
-    for tunnel in tunnel_segments(buildings):
-        horizontal = tunnel.w >= tunnel.h
-        if horizontal:
-            walls.append(RectState(tunnel.x, tunnel.y - WALL, tunnel.w, WALL))
-            walls.append(RectState(tunnel.x, tunnel.y + tunnel.h, tunnel.w, WALL))
-        else:
-            walls.append(RectState(tunnel.x - WALL, tunnel.y, WALL, tunnel.h))
-            walls.append(RectState(tunnel.x + tunnel.w, tunnel.y, WALL, tunnel.h))
+    edge = WALL
+    for row in range(rows):
+        for col in range(cols):
+            if not occupied[row][col]:
+                continue
+            x = min_x + col * unit
+            y = min_y + row * unit
+            if row == 0 or not occupied[row - 1][col]:
+                walls.append(RectState(x, y - edge, unit, edge))
+            if row == rows - 1 or not occupied[row + 1][col]:
+                walls.append(RectState(x, y + unit, unit, edge))
+            if col == 0 or not occupied[row][col - 1]:
+                walls.append(RectState(x - edge, y, edge, unit))
+            if col == cols - 1 or not occupied[row][col + 1]:
+                walls.append(RectState(x + unit, y, edge, unit))
     return walls
 
 

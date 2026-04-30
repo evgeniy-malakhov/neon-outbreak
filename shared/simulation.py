@@ -20,6 +20,7 @@ from shared.constants import (
     PLAYER_RADIUS,
     SEARCH_DURATION,
     SHOT_NOISE,
+    UNARMED_MELEE_NOISE,
     SNEAK_NOISE,
     SPRINT_MULTIPLIER,
     SPRINT_NOISE,
@@ -391,13 +392,16 @@ class GameWorld:
             if command.repair_slot:
                 self._repair_armor(player, command.repair_slot)
             self._update_healing(player, dt)
+            player.melee_cooldown = max(0.0, player.melee_cooldown - dt)
 
             player.angle = player.pos.angle_to(Vec2(command.aim_x, command.aim_y))
             movement = Vec2(command.move_x, command.move_y).normalized()
             player.sneaking = command.sneak and movement.length() > 0
             player.sprinting = command.sprint and not player.sneaking and movement.length() > 0
             speed = player.speed * (0.48 if player.sneaking else SPRINT_MULTIPLIER if player.sprinting else 1.0)
-            player.noise = self._player_noise(player, movement, command.shooting)
+            weapon = player.active_weapon()
+            meleeing = command.alt_attack and weapon is None
+            player.noise = self._player_noise(player, movement, command.shooting, meleeing)
             self._move_circle(player.pos, movement.scaled(speed * dt), PLAYER_RADIUS, player.floor)
             player.pos.clamp_to_map(MAP_WIDTH, MAP_HEIGHT)
             player.inside_building = point_building(self.buildings, player.pos)
@@ -420,17 +424,27 @@ class GameWorld:
                 self._start_reload(player)
             if command.shooting:
                 self._shoot(player)
+            if command.alt_attack:
+                self._unarmed_attack(player)
             if command.throw_grenade:
                 self._throw_grenade(player)
 
-    def _player_noise(self, player: PlayerState, movement: Vec2, shooting: bool) -> float:
+    def _player_noise(self, player: PlayerState, movement: Vec2, shooting: bool, meleeing: bool = False) -> float:
         if player.sneaking:
             return 0.0
+        move_noise = 0.0
+        if movement.length() > 0:
+            move_noise = SPRINT_NOISE if player.sprinting else WALK_NOISE
+        shot_noise = 0.0
         if shooting:
-            return SHOT_NOISE
-        if movement.length() <= 0:
-            return 0.0
-        return SPRINT_NOISE if player.sprinting else WALK_NOISE
+            weapon = player.active_weapon()
+            if weapon:
+                utility_key = weapon.modules.get("utility") or ""
+                utility = WEAPON_MODULES.get(utility_key)
+                multiplier = utility.noise_multiplier if utility else 1.0
+                shot_noise = SHOT_NOISE * multiplier
+        melee_noise = UNARMED_MELEE_NOISE if meleeing else 0.0
+        return max(move_noise, melee_noise, shot_noise)
 
     def _update_projectiles(self, dt: float) -> None:
         dead_projectiles: list[str] = []
@@ -973,6 +987,7 @@ class GameWorld:
         player.healing_left = 0.0
         player.healing_pool = 0.0
         player.healing_rate = 0.0
+        player.healing_stacks = 0
         mitigation = self._player_armor_mitigation(player)
         mitigated = int(damage * mitigation)
         remaining = max(1, damage - mitigated)
@@ -1015,11 +1030,16 @@ class GameWorld:
 
     def _update_healing(self, player: PlayerState, dt: float) -> None:
         if player.healing_left <= 0.0 or player.healing_pool <= 0.0 or player.health >= 100:
+            if player.healing_pool <= 0.0 or player.health >= 100:
+                player.healing_stacks = 0
             return
-        healed = min(player.healing_pool, player.healing_rate * dt)
+        stacks = max(1, player.healing_stacks)
+        healed = min(player.healing_pool, player.healing_rate * dt * stacks)
         player.healing_pool -= healed
         player.healing_left = max(0.0, player.healing_left - dt)
         player.health = min(100, player.health + healed)
+        if player.healing_left <= 0.0 or player.healing_pool <= 0.0 or player.health >= 100:
+            player.healing_stacks = 0
 
     def _set_notice(self, player: PlayerState, key: str, seconds: float = 2.2) -> None:
         player.notice = key
@@ -1202,9 +1222,10 @@ class GameWorld:
         if not spec:
             return False
         if spec.kind in {"food", "medical"} and spec.heal_total > 0 and player.health < 100:
-            player.healing_pool = float(spec.heal_total)
-            player.healing_left = max(0.1, spec.heal_seconds)
+            player.healing_pool += float(spec.heal_total)
+            player.healing_left = max(player.healing_left, max(0.1, spec.heal_seconds))
             player.healing_rate = spec.heal_total / max(0.1, spec.heal_seconds)
+            player.healing_stacks = max(1, player.healing_stacks + 1)
             return True
         if spec.kind == "ammo":
             for weapon in player.weapons.values():
@@ -1402,7 +1423,20 @@ class GameWorld:
         module = WEAPON_MODULES.get(module_key or "")
         if module_key == "laser_module" and weapon.utility_on and module:
             spread *= module.spread_multiplier
+        elif module and module_key in {"silencer", "compensator"}:
+            spread *= module.spread_multiplier
         return spread
+
+    def _weapon_fire_rate(self, weapon: WeaponRuntime) -> float:
+        spec = WEAPONS[weapon.key]
+        rate = spec.fire_rate
+        module_key = weapon.modules.get("utility") or ""
+        module = WEAPON_MODULES.get(module_key)
+        if module and module_key == "compensator":
+            rarity_step = rarity_rank(weapon.rarity)
+            bonus = module.fire_rate_bonus + module.fire_rate_rarity_step * rarity_step
+            rate *= 1.0 + max(0.0, bonus)
+        return max(0.1, rate)
 
     def _toggle_weapon_utility(self, player: PlayerState) -> None:
         weapon = player.active_weapon()
@@ -1437,7 +1471,7 @@ class GameWorld:
         rarity = rarity_spec(weapon.rarity)
         wear = self.rng.uniform(0.08, 0.22) * self.difficulty.weapon_wear_multiplier / rarity.weapon_durability_multiplier
         weapon.durability = max(0.0, weapon.durability - wear)
-        weapon.cooldown = 1.0 / spec.fire_rate
+        weapon.cooldown = 1.0 / self._weapon_fire_rate(weapon)
         damage_multiplier = self.difficulty.weapon_damage_multipliers.get(spec.key, self.difficulty.weapon_damage_multiplier)
         projectile_damage = max(1, int(round(spec.damage * damage_multiplier * rarity.weapon_damage_multiplier)))
         for pellet_index in range(spec.pellets):
@@ -1461,6 +1495,30 @@ class GameWorld:
                 life=0.82,
                 floor=player.floor,
             )
+
+    def _unarmed_attack(self, player: PlayerState) -> None:
+        if player.active_weapon():
+            return
+        if player.melee_cooldown > 0.0:
+            return
+        melee_range = PLAYER_RADIUS + 34.0
+        best_target: ZombieState | None = None
+        best_dist = float("inf")
+        for zombie in self.zombies.values():
+            if zombie.floor != player.floor:
+                continue
+            dist = player.pos.distance_to(zombie.pos)
+            if dist > melee_range + ZOMBIES[zombie.kind].radius:
+                continue
+            delta = abs((player.angle - player.pos.angle_to(zombie.pos) + math.pi) % (2 * math.pi) - math.pi)
+            if delta > math.radians(65.0):
+                continue
+            if dist < best_dist:
+                best_dist = dist
+                best_target = zombie
+        if best_target:
+            self._damage_zombie(best_target, 9, player.id)
+        player.melee_cooldown = 0.38
 
     def _throw_grenade(self, player: PlayerState) -> None:
         if self._grenade_cooldowns.get(player.id, 0.0) > 0:

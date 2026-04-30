@@ -10,10 +10,12 @@ from pathlib import Path
 import pygame
 
 from client.network import OnlineClient, ping_server
+from client.settings_schema import SETTINGS_TABS, tab_has_camera_distance, tab_has_language, tab_is_stub, tab_toggle_keys
+from client.single_setup_schema import DENSITY_ORDER, MAP_OPTIONS
 from shared.constants import ARMORS, MAP_HEIGHT, MAP_WIDTH, SLOTS, WEAPONS, ZOMBIES
 from shared.crafting import craft_rarity_chances
 from shared.difficulty import DIFFICULTY_KEYS, load_difficulty
-from shared.explosives import GRENADE_SPECS, DEFAULT_GRENADE
+from shared.explosives import GRENADE_SPECS, MINE_SPECS, DEFAULT_GRENADE, DEFAULT_MINE
 from shared.items import EQUIPMENT_SLOTS, ITEMS, RECIPES
 from shared.level import tunnel_segments
 from shared.models import BuildingState, ClientCommand, InputCommand, LootState, PlayerState, RectState, Vec2, WorldSnapshot
@@ -114,6 +116,10 @@ class GameApp:
         self.small = pygame.font.SysFont("segoeui", 14)
         self.big = pygame.font.SysFont("segoeui", 56, bold=True)
         self.mid = pygame.font.SysFont("segoeui", 26, bold=True)
+        self.label_font = pygame.font.SysFont("cambria", 19, bold=True)
+        self.hud_title_font = pygame.font.SysFont("trebuchetms", 24, bold=True)
+        self.hud_value_font = pygame.font.SysFont("consolas", 24, bold=True)
+        self.emphasis_font = pygame.font.SysFont("georgia", 16, bold=True, italic=True)
         self.language = "en"
         self.locales = self._load_locales()
         self.icon_mapping = self._load_icon_mapping()
@@ -121,9 +127,15 @@ class GameApp:
         self._icon_cache: dict[tuple[str, int, int], pygame.Surface] = {}
         self.damage_flash = 0.0
         self._last_local_health: float | None = None
-        self.camera_zoom = 1.0
-        self.state = "menu"
+        self._regen_target_health: float | None = None
+        self._prev_grenade_state: dict[str, tuple[Vec2, int, str]] = {}
+        self._prev_mine_state: dict[str, tuple[Vec2, int, str]] = {}
+        self._explosion_effects: list[dict[str, object]] = []
+        self.scoreboard_scroll = 0
         saved_settings = self._load_client_settings()
+        self.camera_distance = max(0.78, min(1.08, float(saved_settings.get("camera_distance", 0.92))))
+        self.camera_zoom = self.camera_distance
+        self.state = "menu"
         self.player_name = self._clean_player_name(str(saved_settings.get("player_name", "Operator")))
         self.name_editing = False
         self.name_input = self.player_name
@@ -137,6 +149,7 @@ class GameApp:
         self.weapon_custom_open = False
         self.minimap_big = False
         self.craft_scroll = 0
+        self.weapon_modules_scroll = 0
         self.running = True
         self.pending_reload = False
         self.pending_pickup = False
@@ -153,29 +166,47 @@ class GameApp:
         self._local_command_id = 0
         self.drag_source: dict[str, object] | None = None
         self.custom_weapon_slot = "1"
+        self.language = str(saved_settings.get("language", self.language))
+        if self.language not in self.locales:
+            self.language = "en"
         self.settings = {
-            "bot_vision": True,
-            "bot_vision_range": True,
-            "ai_reactions": True,
-            "health_bars": True,
-            "noise_radius": True,
+            "bot_vision": bool(saved_settings.get("bot_vision", True)),
+            "bot_vision_range": bool(saved_settings.get("bot_vision_range", True)),
+            "ai_reactions": bool(saved_settings.get("ai_reactions", True)),
+            "health_bars": bool(saved_settings.get("health_bars", True)),
+            "noise_radius": bool(saved_settings.get("noise_radius", True)),
             "show_zombie_count": bool(saved_settings.get("show_zombie_count", False)),
-            "fullscreen": False,
+            "fullscreen": bool(saved_settings.get("fullscreen", False)),
         }
-        self.bot_density = "normal"
+        self.bot_density = str(saved_settings.get("single_bot_density", "normal"))
         self.bot_density_profiles = {
             "low": 0.65,
             "normal": 1.0,
             "high": 1.42,
         }
-        self.difficulty_key = "medium"
+        if self.bot_density not in self.bot_density_profiles:
+            self.bot_density = "normal"
+        self.single_bots_enabled = bool(saved_settings.get("single_bots_enabled", True))
+        self.single_map_key = str(saved_settings.get("single_map", "city"))
+        self.difficulty_key = str(saved_settings.get("single_difficulty", "medium"))
         self.difficulty_options = list(DIFFICULTY_KEYS)
+        if self.difficulty_key not in self.difficulty_options:
+            self.difficulty_key = "medium"
+        self.settings_tab = "general"
+        self.settings_tabs = [tab.key for tab in SETTINGS_TABS]
+        self.options_scroll = 0
+        self.pause_settings_scroll = 0
+        self.single_map_dropdown_open = False
+        self.single_map_dropdown_alpha = 0.0
+        self.single_map_scroll = 0
         self.server_entries: list[ServerEntry] = []
         self.selected_server = 0
         self._last_ping_refresh = 0.0
         self._pinging = False
         # Create responsive menu buttons with proper centering
         self._menu_buttons = self._create_menu_buttons()
+        if self.settings["fullscreen"]:
+            self._set_display_mode(True)
 
     def _create_menu_buttons(self) -> list[Button]:
         """Create menu buttons with responsive positioning"""
@@ -215,8 +246,14 @@ class GameApp:
     def _save_client_settings(self) -> None:
         data = {
             "player_name": self.player_name,
-            "show_zombie_count": bool(self.settings.get("show_zombie_count", False)),
+            "language": self.language,
+            "camera_distance": round(self.camera_distance, 3),
+            "single_difficulty": self.difficulty_key,
+            "single_bot_density": self.bot_density,
+            "single_bots_enabled": self.single_bots_enabled,
+            "single_map": self.single_map_key,
         }
+        data.update({key: bool(value) for key, value in self.settings.items()})
         try:
             CLIENT_SETTINGS_PATH.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
         except OSError:
@@ -393,7 +430,7 @@ class GameApp:
                 self.craft_open = False
             elif self.state == "servers":
                 self._back_to_menu()
-            elif self.state == "options":
+            elif self.state in {"options", "single_setup"}:
                 self.state = "menu"
             elif self.state in {"single", "online_game"}:
                 self.settings_open = True
@@ -440,6 +477,10 @@ class GameApp:
 
     def _handle_mouse_down(self, event: pygame.event.Event) -> None:
         pos = self._display_to_screen(event.pos)
+        if self.weapon_custom_open and event.button in (4, 5):
+            if self._weapon_module_viewport_rect().collidepoint(pos):
+                self._scroll_weapon_modules(-1 if event.button == 4 else 1)
+                return
         if self.craft_open and event.button in (4, 5):
             self._scroll_crafting(-1 if event.button == 4 else 1)
             return
@@ -455,6 +496,7 @@ class GameApp:
             elif event.button == 1 and self._customize_button_rect().collidepoint(pos):
                 self.custom_weapon_slot = self._custom_weapon_slot(player)
                 self.weapon_custom_open = True
+                self.weapon_modules_scroll = 0
                 self.drag_source = None
                 return
             repair_slot = self._repair_slot_at(pos)
@@ -534,59 +576,96 @@ class GameApp:
             self.drag_source = None
 
     def _handle_mouse_wheel(self, event: pygame.event.Event) -> None:
+        if self.weapon_custom_open and self.backpack_open and self._weapon_module_viewport_rect().collidepoint(self._mouse_pos()):
+            self._scroll_weapon_modules(-event.y)
+            return
         if self.craft_open:
             self._scroll_crafting(-event.y)
+            return
+        if self.state == "options":
+            self._scroll_options(-event.y)
+            return
+        if self.settings_open and self.state in {"single", "online_game"}:
+            self._scroll_options(-event.y)
+            return
+        if self.backpack_open:
+            return
+        if self.state in {"single", "online_game"} and pygame.key.get_pressed()[pygame.K_TAB]:
+            self._scroll_scoreboard(-event.y)
 
     def _handle_click(self, pos: tuple[int, int]) -> None:
         if self.state == "menu":
             for button in self._menu_buttons:
                 if button.hovered(pos):
                     if button.action == "single":
-                        self._start_single_player()
+                        self.state = "single_setup"
                     elif button.action == "online":
                         self._show_servers()
                     elif button.action == "options":
+                        self.settings_tab = "general"
+                        self.options_scroll = 0
                         self.state = "options"
                     elif button.action == "quit":
                         self.running = False
         elif self.state == "options":
             self._handle_settings_click(pos)
+        elif self.state == "single_setup":
+            self._handle_single_setup_click(pos)
         elif self.state == "servers":
             self._handle_server_click(pos)
         elif self.inventory_open and self.state in {"single", "online_game"}:
             self._handle_inventory_click(pos)
 
     def _handle_settings_click(self, pos: tuple[int, int]) -> None:
-        if self.state == "options" and self._settings_back_rect().collidepoint(pos):
+        if self.state == "options":
+            self._handle_options_click(pos)
+            return
+        if self.state in {"single", "online_game"}:
+            self._handle_pause_settings_click(pos)
+            return
+
+    def _handle_pause_settings_click(self, pos: tuple[int, int]) -> None:
+        if self._settings_resume_rect().collidepoint(pos):
+            self.settings_open = False
+            return
+        if self._settings_main_menu_rect().collidepoint(pos):
+            self._back_to_menu()
+            return
+        panel = self._settings_panel_rect()
+        for index, tab in enumerate(self.settings_tabs):
+            rect = pygame.Rect(panel.x + 32 + index * 112, panel.y + 106, 102, 36)
+            if rect.collidepoint(pos):
+                self.settings_tab = tab
+                self.options_scroll = 0
+                return
+        self._handle_options_click(pos)
+
+    def _handle_options_click(self, pos: tuple[int, int]) -> None:
+        panel = self._settings_panel_rect()
+        if self._settings_back_rect().collidepoint(pos):
             if self.name_editing:
                 self._commit_player_name()
             self.state = "menu"
             return
-        if self.state in {"single", "online_game"}:
-            if self._settings_resume_rect().collidepoint(pos):
-                if self.name_editing:
-                    self._commit_player_name()
-                self.settings_open = False
+        for index, tab in enumerate(self.settings_tabs):
+            rect = pygame.Rect(panel.x + 32 + index * 112, panel.y + 106, 102, 36)
+            if rect.collidepoint(pos):
+                self.settings_tab = tab
+                self.options_scroll = 0
                 return
-            if self._settings_main_menu_rect().collidepoint(pos):
-                if self.name_editing:
-                    self._commit_player_name()
-                self._back_to_menu()
-                return
-        if self._settings_name_rect().collidepoint(pos):
-            self.name_editing = True
-            self.name_input = self.player_name
+        if tab_is_stub(self.settings_tab):
             return
-        if self.name_editing:
-            self._commit_player_name()
-        options = list(self.settings)
-        start_y, step_y = self._settings_grid()
-        panel = self._settings_panel_rect()
-        option_width = 400
-        option_height = 40
-        option_x = panel.x + (panel.w - option_width) // 2
+        viewport = pygame.Rect(panel.x + 36, panel.y + 162, panel.w - 72, panel.h - 238)
+        if not viewport.collidepoint(pos):
+            return
+        options = tab_toggle_keys(self.settings_tab)
+        step_y = 56
+        option_height = 44
+        option_x = viewport.x + 6
+        option_width = viewport.w - 24
         for index, key in enumerate(options):
-            rect = pygame.Rect(option_x, start_y + index * step_y, option_width, option_height)
+            y = viewport.y + index * step_y - self.options_scroll
+            rect = pygame.Rect(option_x, y, option_width, option_height)
             if rect.collidepoint(pos):
                 if key == "fullscreen":
                     self._toggle_fullscreen()
@@ -595,20 +674,23 @@ class GameApp:
                     if key == "show_zombie_count":
                         self._save_client_settings()
                 return
-        density_rect = pygame.Rect(option_x, start_y + len(options) * step_y, option_width, option_height)
-        if density_rect.collidepoint(pos):
-            order = ["low", "normal", "high"]
-            self.bot_density = order[(order.index(self.bot_density) + 1) % len(order)]
-            return
-        difficulty_rect = pygame.Rect(option_x, start_y + (len(options) + 1) * step_y, option_width, option_height)
-        if difficulty_rect.collidepoint(pos):
-            index = self.difficulty_options.index(self.difficulty_key)
-            self.difficulty_key = self.difficulty_options[(index + 1) % len(self.difficulty_options)]
-            return
-        language_rect = pygame.Rect(option_x, start_y + (len(options) + 2) * step_y, option_width, option_height)
-        if language_rect.collidepoint(pos):
+        row_index = len(options)
+        if tab_has_camera_distance(self.settings_tab):
+            camera_rect = pygame.Rect(option_x, viewport.y + row_index * step_y - self.options_scroll, option_width, option_height)
+            if camera_rect.collidepoint(pos):
+                cycle = [1.0, 0.92, 0.84]
+                nearest = min(cycle, key=lambda value: abs(value - self.camera_distance))
+                self.camera_distance = cycle[(cycle.index(nearest) + 1) % len(cycle)]
+                self._save_client_settings()
+                return
+            row_index += 1
+        if tab_has_language(self.settings_tab):
+            language_rect = pygame.Rect(option_x, viewport.y + row_index * step_y - self.options_scroll, option_width, option_height)
+            if not language_rect.collidepoint(pos):
+                return
             languages = sorted(self.locales)
             self.language = languages[(languages.index(self.language) + 1) % len(languages)]
+            self._save_client_settings()
 
     def _handle_craft_click(self, pos: tuple[int, int]) -> None:
         if self._craft_scroll_track_rect().collidepoint(pos):
@@ -633,10 +715,11 @@ class GameApp:
                 self.custom_weapon_slot = slot
                 return True
         weapon_slot = self._custom_weapon_slot(player)
+        viewport = self._weapon_module_viewport_rect()
         for module_key, indices in self._available_module_groups(player):
             rect = self._available_module_rect(module_key)
             module = WEAPON_MODULES.get(module_key)
-            if rect.collidepoint(pos) and module and indices and player.weapons.get(weapon_slot):
+            if viewport.collidepoint(pos) and rect.collidepoint(pos) and module and indices and player.weapons.get(weapon_slot):
                 self.pending_inventory_action = {
                     "type": "move",
                     "src": "backpack",
@@ -677,6 +760,8 @@ class GameApp:
             self.pending_medkit = True
 
     def _update(self, dt: float) -> None:
+        target_dropdown = 1.0 if self.single_map_dropdown_open and self.state == "single_setup" else 0.0
+        self.single_map_dropdown_alpha += (target_dropdown - self.single_map_dropdown_alpha) * min(1.0, dt * 8.0)
         if self.state == "servers" and time.time() - self._last_ping_refresh > 4.0:
             self._refresh_pings()
 
@@ -715,7 +800,9 @@ class GameApp:
     def _update_camera_zoom(self, dt: float) -> None:
         snapshot = self._snapshot()
         player = self._local_player(snapshot) if snapshot else None
-        target = 0.84 if player and player.alive and player.sprinting else 1.0
+        sprint_target = self.camera_distance * 0.9
+        target = sprint_target if player and player.alive and player.sprinting else self.camera_distance
+        target = max(0.72, min(1.12, target))
         speed = 3.1 if target < self.camera_zoom else 4.8
         blend = 1.0 - math.exp(-speed * max(0.0, dt))
         self.camera_zoom += (target - self.camera_zoom) * blend
@@ -733,6 +820,7 @@ class GameApp:
         if previous is not None and player.alive and player.health < previous - 0.1:
             loss = previous - player.health
             self.damage_flash = min(1.0, max(self.damage_flash, 0.25 + min(0.55, loss / 55.0)))
+            self._regen_target_health = None
         self._last_local_health = player.health
 
     def _build_input(self, player_id: str) -> InputCommand:
@@ -746,7 +834,11 @@ class GameApp:
         snapshot = self._snapshot()
         player = self._local_player(snapshot) if snapshot else None
         mouse_world = self._mouse_world(player)
-        if player and pygame.mouse.get_pressed(num_buttons=3)[2]:
+        mouse_buttons = pygame.mouse.get_pressed(num_buttons=3)
+        right_pressed = bool(mouse_buttons[2])
+        left_pressed = bool(mouse_buttons[0])
+        has_weapon = bool(player and player.active_weapon())
+        if player and right_pressed:
             to_mouse = Vec2(mouse_world.x - player.pos.x, mouse_world.y - player.pos.y)
             if to_mouse.length() > 20:
                 direction = to_mouse.normalized()
@@ -759,7 +851,8 @@ class GameApp:
             move_y=move_y,
             aim_x=mouse_world.x,
             aim_y=mouse_world.y,
-            shooting=pygame.mouse.get_pressed(num_buttons=3)[0] and not ui_open,
+            shooting=left_pressed and not ui_open,
+            alt_attack=right_pressed and not has_weapon and not ui_open,
             sprint=keys[pygame.K_LSHIFT] or keys[pygame.K_RSHIFT],
             sneak=keys[pygame.K_LCTRL] or keys[pygame.K_RCTRL],
         )
@@ -831,8 +924,12 @@ class GameApp:
             self.world.close()
         difficulty = load_difficulty(self.difficulty_key)
         density = self.bot_density_profiles[self.bot_density]
-        initial_zombies = max(1, int(round(difficulty.initial_zombies * density)))
-        max_zombies = max(initial_zombies, int(round(difficulty.max_zombies * density)))
+        if self.single_bots_enabled:
+            initial_zombies = max(1, int(round(difficulty.initial_zombies * density)))
+            max_zombies = max(initial_zombies, int(round(difficulty.max_zombies * density)))
+        else:
+            initial_zombies = 0
+            max_zombies = 0
         self.world = GameWorld(
             seed=int(time.time()),
             initial_zombies=initial_zombies,
@@ -847,6 +944,7 @@ class GameApp:
         self.craft_open = False
         self.weapon_custom_open = False
         self.state = "single"
+        self._save_client_settings()
 
     def _show_servers(self) -> None:
         self.state = "servers"
@@ -975,6 +1073,8 @@ class GameApp:
     def _draw(self) -> None:
         if self.state == "menu":
             self._draw_menu()
+        elif self.state == "single_setup":
+            self._draw_single_setup()
         elif self.state == "options":
             self._draw_options_menu()
         elif self.state == "servers":
@@ -986,6 +1086,7 @@ class GameApp:
     def _draw_menu(self) -> None:
         self.screen.fill(BG)
         self._draw_neon_background()
+        pulse = (math.sin(time.time() * 2.8) + 1.0) * 0.5
 
         # Create responsive main menu panel
         panel_width = 420
@@ -996,6 +1097,9 @@ class GameApp:
 
         pygame.draw.rect(self.screen, (10, 15, 25), panel, border_radius=12)
         pygame.draw.rect(self.screen, CYAN, panel, 2, border_radius=12)
+        glow = pygame.Surface(panel.inflate(26, 26).size, pygame.SRCALPHA)
+        pygame.draw.rect(glow, (76, 225, 255, int(22 + pulse * 34)), glow.get_rect(), 2, border_radius=16)
+        self.screen.blit(glow, panel.inflate(26, 26))
 
         # Improved text positioning
         self._draw_text_fit(self.tr("app.title"), pygame.Rect(panel.x + 28, panel.y + 32, panel.w - 56, 64), TEXT, self.big, center=True)
@@ -1007,29 +1111,111 @@ class GameApp:
         self._draw_menu_showcase()
 
     def _draw_menu_showcase(self) -> None:
-        pygame.draw.rect(self.screen, (12, 18, 28), pygame.Rect(492, 96, 662, 500), border_radius=10)
-        pygame.draw.rect(self.screen, (58, 78, 108), pygame.Rect(492, 96, 662, 500), 2, border_radius=10)
+        pulse = (math.sin(time.time() * 3.3) + 1.0) * 0.5
+        showcase = pygame.Rect(492, 96, 662, 548)
+        pygame.draw.rect(self.screen, (12, 18, 28), showcase, border_radius=10)
+        pygame.draw.rect(self.screen, (58, 78, 108), showcase, 2, border_radius=10)
+        pulse_outline = pygame.Surface((676, 562), pygame.SRCALPHA)
+        pygame.draw.rect(pulse_outline, (104, 198, 255, int(16 + pulse * 48)), pulse_outline.get_rect(), 1, border_radius=12)
+        self.screen.blit(pulse_outline, (485, 89))
         for i in range(7):
             pygame.draw.line(self.screen, (25, 38, 58), (530 + i * 88, 128), (460 + i * 118, 562), 2)
         self._draw_text(self.tr("menu.systems"), 536, 132, TEXT, self.big)
         cards = [
-            (self.tr("menu.card.stealth.title"), self.tr("menu.card.stealth.body"), CYAN),
-            (self.tr("menu.card.ai.title"), self.tr("menu.card.ai.body"), YELLOW),
-            (self.tr("menu.card.craft.title"), self.tr("menu.card.craft.body"), GREEN),
+            (self.tr("menu.card.stealth.title"), self.tr("menu.card.stealth.body"), CYAN, "silence"),
+            (self.tr("menu.card.ai.title"), self.tr("menu.card.ai.body"), YELLOW, "ai"),
+            (self.tr("menu.card.craft.title"), self.tr("menu.card.craft.body"), GREEN, "loot"),
+            (self.tr("menu.card.online.title"), self.tr("menu.card.online.body"), PURPLE, "online"),
         ]
-        for index, (title, body, color) in enumerate(cards):
-            rect = pygame.Rect(540, 226 + index * 94, 520, 72)
+        for index, (title, body, color, image_key) in enumerate(cards):
+            rect = pygame.Rect(530, 226 + index * 92, 556, 74)
+            hover_pulse = 0.5 + 0.5 * math.sin(time.time() * 4.8 + index)
             pygame.draw.rect(self.screen, PANEL, rect, border_radius=8)
             pygame.draw.rect(self.screen, (54, 74, 104), rect, 1, border_radius=8)
-            pygame.draw.circle(self.screen, color, (rect.x + 34, rect.y + 36), 13)
-            pygame.draw.circle(self.screen, TEXT, (rect.x + 34, rect.y + 36), 13, 1)
-            self._draw_text(title, rect.x + 62, rect.y + 12, TEXT, self.mid)
-            self._draw_text(body, rect.x + 64, rect.y + 44, MUTED, self.small)
+            glow = pygame.Surface(rect.inflate(10, 10).size, pygame.SRCALPHA)
+            pygame.draw.rect(glow, (*color, int(18 + hover_pulse * 38)), glow.get_rect(), 1, border_radius=10)
+            self.screen.blit(glow, rect.inflate(10, 10))
+            image_rect = pygame.Rect(rect.x + 14, rect.y + 11, 52, 52)
+            pygame.draw.rect(self.screen, (10, 16, 28), image_rect, border_radius=9)
+            pygame.draw.rect(self.screen, color, image_rect, 2, border_radius=9)
+            if not self._draw_item_icon(image_key, image_rect.inflate(-8, -8), aura=False, shadow=False):
+                pygame.draw.circle(self.screen, color, image_rect.center, 12)
+            self._draw_text(title, rect.x + 80, rect.y + 10, TEXT, self.mid)
+            self._draw_text(body, rect.x + 82, rect.y + 44, MUTED, self.small)
 
     def _draw_options_menu(self) -> None:
         self.screen.fill(BG)
         self._draw_neon_background()
-        self._draw_settings(panel_only=True)
+        self._draw_settings_hub()
+
+    def _draw_single_setup(self) -> None:
+        self.screen.fill(BG)
+        self._draw_neon_background()
+        panel = pygame.Rect((SCREEN_W - 660) // 2, 120, 660, 500)
+        pygame.draw.rect(self.screen, PANEL, panel, border_radius=12)
+        pygame.draw.rect(self.screen, CYAN, panel, 2, border_radius=12)
+        self._draw_text_fit(self.tr("single.setup.title"), pygame.Rect(panel.x + 24, panel.y + 28, panel.w - 48, 42), TEXT, self.big, center=True)
+        self._draw_text_fit(self.tr("single.setup.caption"), pygame.Rect(panel.x + 28, panel.y + 76, panel.w - 56, 24), MUTED, self.small, center=True)
+        mouse = self._mouse_pos()
+        rows = [
+            (self.tr("single.setup.map"), self.single_map_key.upper()),
+            (self.tr("single.setup.difficulty"), self.tr(f"difficulty.{self.difficulty_key}")),
+            (self.tr("single.setup.bots"), self.tr("state.on") if self.single_bots_enabled else self.tr("state.off")),
+            (self.tr("single.setup.bot_density"), self.tr(f"density.{self.bot_density}")),
+        ]
+        for index, (left, right) in enumerate(rows):
+            rect = pygame.Rect(panel.x + 56, panel.y + 130 + index * 70, panel.w - 112, 50)
+            hovered = rect.collidepoint(mouse)
+            locked = index in {1, 3} and not self.single_bots_enabled
+            pulse = (math.sin(time.time() * 6.0 + index) + 1.0) * 0.5
+            bg_color = (24, 30, 46) if locked else PANEL_2 if hovered else PANEL
+            border_color = (92, 124, 172) if not locked else (82, 86, 102)
+            pygame.draw.rect(self.screen, bg_color, rect, border_radius=10)
+            pygame.draw.rect(self.screen, border_color, rect, 2, border_radius=10)
+            if hovered and not locked:
+                glow = pygame.Surface(rect.inflate(12, 12).size, pygame.SRCALPHA)
+                pygame.draw.rect(glow, (96, 206, 255, int(20 + pulse * 52)), glow.get_rect(), 1, border_radius=12)
+                self.screen.blit(glow, rect.inflate(12, 12))
+            self._draw_text_fit(left, pygame.Rect(rect.x + 16, rect.y + 14, rect.w - 180, 22), TEXT, self.font)
+            value_color = CYAN
+            if index == 1:
+                value_color = GREEN if self.difficulty_key == "easy" else YELLOW if self.difficulty_key == "medium" else RED if self.difficulty_key == "hard" else PURPLE
+            elif index == 3:
+                value_color = GREEN if self.bot_density == "low" else YELLOW if self.bot_density == "normal" else RED
+            if locked:
+                value_color = MUTED
+            self._draw_text_fit(right, pygame.Rect(rect.right - 170, rect.y + 14, 154, 22), value_color, self.hud_title_font, center=True)
+            if index == 0:
+                caret = "v" if self.single_map_dropdown_open else ">"
+                self._draw_text_fit(caret, pygame.Rect(rect.right - 32, rect.y + 16, 16, 18), CYAN, self.font, center=True)
+        self._draw_single_map_dropdown(panel)
+        back_rect = pygame.Rect(panel.x + 56, panel.bottom - 72, 230, 46)
+        start_rect = pygame.Rect(panel.right - 286, panel.bottom - 72, 230, 46)
+        self._draw_button(back_rect, self.tr("settings.back"), back_rect.collidepoint(mouse))
+        self._draw_button(start_rect, self.tr("single.setup.start"), start_rect.collidepoint(mouse))
+
+    def _draw_single_map_dropdown(self, panel: pygame.Rect) -> None:
+        if self.single_map_dropdown_alpha <= 0.01:
+            return
+        row = pygame.Rect(panel.x + 56, panel.y + 130, panel.w - 112, 50)
+        popup = pygame.Rect(row.x, row.bottom + 6, row.w, 120)
+        surface = pygame.Surface(popup.size, pygame.SRCALPHA)
+        alpha = int(220 * self.single_map_dropdown_alpha)
+        pygame.draw.rect(surface, (14, 20, 32, alpha), surface.get_rect(), border_radius=10)
+        pygame.draw.rect(surface, (98, 176, 255, int(180 * self.single_map_dropdown_alpha)), surface.get_rect(), 2, border_radius=10)
+        self.screen.blit(surface, popup)
+        options = list(MAP_OPTIONS)
+        for index, option in enumerate(options):
+            item = pygame.Rect(popup.x + 10, popup.y + 10 + index * 36, popup.w - 30, 30)
+            hovered = item.collidepoint(self._mouse_pos())
+            pygame.draw.rect(self.screen, PANEL_2 if hovered else BG, item, border_radius=7)
+            pygame.draw.rect(self.screen, CYAN if option == self.single_map_key else (64, 84, 116), item, 1, border_radius=7)
+            self._draw_text_fit(option.upper(), item.inflate(-10, -6), CYAN if option == self.single_map_key else TEXT, self.font)
+        track = pygame.Rect(popup.right - 14, popup.y + 10, 6, popup.h - 20)
+        pygame.draw.rect(self.screen, (18, 25, 40), track, border_radius=4)
+        pygame.draw.rect(self.screen, (88, 160, 224), track, 1, border_radius=4)
+        knob = pygame.Rect(track.x + 1, track.y + 1, track.w - 2, max(18, track.h - 2))
+        pygame.draw.rect(self.screen, CYAN, knob, border_radius=4)
 
     def _draw_servers(self) -> None:
         self.screen.fill(BG)
@@ -1056,9 +1242,13 @@ class GameApp:
             readiness = self.tr("servers.ready") if entry.ready else self.tr("servers.not_ready") if entry.ping_ms is not None else self.tr("servers.offline")
             status = f"{ping}  {players}  {readiness}" if entry.pvp else f"{ping}  {players}  {readiness}  {difficulty}"
             self._draw_text_fit(status, pygame.Rect(rect.x + 485, rect.y + 18, 210, 22), GREEN if entry.ready else YELLOW if entry.ping_ms else RED, self.small)
-        self._draw_button(pygame.Rect(72, 632, 180, 46), self.tr("servers.back"), False)
-        self._draw_button(pygame.Rect(270, 632, 180, 46), self.tr("servers.refresh"), False)
-        self._draw_button(pygame.Rect(470, 632, 180, 46), self.tr("servers.connect"), False)
+        back_rect = pygame.Rect(72, 632, 180, 46)
+        refresh_rect = pygame.Rect(270, 632, 180, 46)
+        connect_rect = pygame.Rect(470, 632, 180, 46)
+        mouse = self._mouse_pos()
+        self._draw_button(back_rect, self.tr("servers.back"), back_rect.collidepoint(mouse))
+        self._draw_button(refresh_rect, self.tr("servers.refresh"), refresh_rect.collidepoint(mouse))
+        self._draw_button(connect_rect, self.tr("servers.connect"), connect_rect.collidepoint(mouse))
 
     def _draw_game(self) -> None:
         snapshot = self._snapshot()
@@ -1067,6 +1257,7 @@ class GameApp:
         self.screen.fill(BG)
         self._draw_world_background(camera)
         if snapshot:
+            self._update_explosion_effects(snapshot, player)
             self._draw_tunnels(snapshot, camera, player)
             self._draw_buildings(snapshot, camera, player)
             if player and self.settings["noise_radius"]:
@@ -1079,6 +1270,7 @@ class GameApp:
             self._draw_zombies(snapshot, camera)
             self._draw_players(snapshot, camera)
             self._draw_weapon_utilities(snapshot, camera, player)
+            self._draw_explosion_effects(camera, player)
             if player:
                 self._draw_tunnel_darkness(player, camera)
             if player:
@@ -1100,7 +1292,7 @@ class GameApp:
             if self.craft_open and player:
                 self._draw_crafting(player)
             if self.settings_open:
-                self._draw_settings()
+                self._draw_settings_hub(in_game=True)
 
     def _draw_neon_background(self) -> None:
         for i in range(18):
@@ -1139,12 +1331,22 @@ class GameApp:
     def _draw_tunnels(self, snapshot: WorldSnapshot, camera: Vec2, player: PlayerState | None) -> None:
         if not player or player.floor >= 0:
             return
-        for tunnel in tunnel_segments(snapshot.buildings):
+        segments = tunnel_segments(snapshot.buildings)
+        for index, tunnel in enumerate(segments):
             rect = self._world_rect_to_screen(tunnel, camera)
             if not rect.colliderect(pygame.Rect(-120, -120, SCREEN_W + 240, SCREEN_H + 240)):
                 continue
-            pygame.draw.rect(self.screen, (10, 14, 20), rect, border_radius=10)
-            pygame.draw.rect(self.screen, (38, 52, 68), rect, 2, border_radius=10)
+            pulse = 0.5 + 0.5 * math.sin(snapshot.time * 2.6 + index * 0.33)
+            pygame.draw.rect(self.screen, (8, 12, 18), rect, border_radius=10)
+            pygame.draw.rect(self.screen, (34, 49, 66), rect, 2, border_radius=10)
+            center_line = rect.inflate(-max(8, rect.w // 7), -max(8, rect.h // 7))
+            if center_line.w > 6 and center_line.h > 6:
+                glow = pygame.Surface(center_line.size, pygame.SRCALPHA)
+                pygame.draw.rect(glow, (34, 52, 78, int(42 + pulse * 24)), glow.get_rect(), border_radius=7)
+                pygame.draw.rect(glow, (66, 106, 146, int(28 + pulse * 36)), glow.get_rect(), 1, border_radius=7)
+                self.screen.blit(glow, center_line)
+            node = self._world_to_screen(tunnel.center, camera)
+            pygame.draw.circle(self.screen, (98, 136, 176), node, 2)
 
     def _draw_buildings(self, snapshot: WorldSnapshot, camera: Vec2, player: PlayerState | None) -> None:
         for building in snapshot.buildings.values():
@@ -1159,7 +1361,12 @@ class GameApp:
             pygame.draw.rect(self.screen, outline, rect, 2, border_radius=3)
             if player_inside:
                 floor_label = f"{building.name} {self._floor_label(player.floor)}"
-                self._draw_text(floor_label, bx + 18, by + 14, CYAN, self.small)
+                label_rect = pygame.Rect(bx + 14, by + 10, max(120, rect.w - 28), 24)
+                label_bg = pygame.Surface(label_rect.size, pygame.SRCALPHA)
+                pygame.draw.rect(label_bg, (8, 14, 24, 128), label_bg.get_rect(), border_radius=8)
+                pygame.draw.rect(label_bg, (78, 114, 150, 84), label_bg.get_rect(), 1, border_radius=8)
+                self.screen.blit(label_bg, label_rect)
+                self._draw_text_fit(floor_label, label_rect.inflate(-10, -4), CYAN, self.label_font)
             for wall in building.walls:
                 self._draw_rect_world(wall, camera, (77, 91, 117))
             for prop in building.props:
@@ -1167,8 +1374,15 @@ class GameApp:
                     continue
                 if not player_inside and prop.kind not in {"shelf", "crate", "barrel", "pallet", "roadblock"}:
                     continue
-                color = (111, 92, 72) if prop.kind in {"desk", "table", "pallet"} else (110, 74, 54) if prop.kind == "barrel" else (82, 96, 124)
-                self._draw_rect_world(prop.rect, camera, color)
+                if prop.kind == "glass_wall":
+                    prop_rect = self._world_rect_to_screen(prop.rect, camera)
+                    glass = pygame.Surface(prop_rect.size, pygame.SRCALPHA)
+                    pygame.draw.rect(glass, (136, 220, 255, 76), glass.get_rect(), border_radius=3)
+                    pygame.draw.rect(glass, (196, 246, 255, 122), glass.get_rect(), 2, border_radius=3)
+                    self.screen.blit(glass, prop_rect)
+                else:
+                    color = (111, 92, 72) if prop.kind in {"desk", "table", "pallet"} else (110, 74, 54) if prop.kind == "barrel" else (82, 96, 124)
+                    self._draw_rect_world(prop.rect, camera, color)
             for stairs in building.stairs:
                 if player_inside or not player:
                     self._draw_rect_world(stairs, camera, (86, 126, 164))
@@ -1187,11 +1401,17 @@ class GameApp:
             return
         sx, sy = self._world_to_screen(player.pos, camera)
         radius = self._world_size(max(12, min(460, player.noise)), 8)
-        surface = pygame.Surface((radius * 2 + 8, radius * 2 + 8), pygame.SRCALPHA)
-        color = (76, 225, 255, 30) if player.sneaking else (255, 210, 112, 34)
-        pygame.draw.circle(surface, color, (radius + 4, radius + 4), radius)
-        pygame.draw.circle(surface, (255, 255, 255, 48), (radius + 4, radius + 4), radius, 1)
-        self.screen.blit(surface, (sx - radius - 4, sy - radius - 4))
+        pulse = 0.5 + 0.5 * math.sin(time.time() * (8.2 if player.sprinting else 6.1))
+        surface = pygame.Surface((radius * 2 + 24, radius * 2 + 24), pygame.SRCALPHA)
+        center = (radius + 12, radius + 12)
+        base = (82, 232, 255) if player.sneaking else (255, 198, 102)
+        for layer in range(4, 0, -1):
+            layer_radius = int(radius * (0.48 + layer * 0.16 + pulse * 0.04))
+            alpha = max(10, int((42 if player.sneaking else 50) - layer * 8 + pulse * 18))
+            pygame.draw.circle(surface, (*base, alpha), center, max(8, layer_radius), 2)
+        pygame.draw.circle(surface, (*base, 24), center, radius)
+        pygame.draw.circle(surface, (255, 255, 255, 56), center, radius, 1)
+        self.screen.blit(surface, (sx - center[0], sy - center[1]))
 
     def _draw_rect_world(self, rect: RectState, camera: Vec2, color: tuple[int, int, int]) -> None:
         screen_rect = self._world_rect_to_screen(rect, camera)
@@ -1291,12 +1511,33 @@ class GameApp:
             pulse = int(7 + progress * 10)
             color = (103, 236, 190) if grenade.kind == "contact_grenade" else (255, 128, 92) if grenade.kind == "heavy_grenade" else GREEN
             warning = RED if grenade.timer <= 0.55 else color
-            pygame.draw.circle(self.screen, (10, 16, 12), (sx, sy), pulse + 5)
-            pygame.draw.circle(self.screen, warning, (sx, sy), pulse)
-            pygame.draw.circle(self.screen, (255, 255, 255), (sx, sy), max(3, pulse - 5), 1)
+            glow = pygame.Surface((84, 84), pygame.SRCALPHA)
+            pygame.draw.circle(glow, (*warning, int(44 + progress * 56)), (42, 42), 20 + int(progress * 14))
+            self.screen.blit(glow, (sx - 42, sy - 42))
+            pygame.draw.circle(self.screen, (10, 16, 12), (sx, sy), pulse + 6)
+            pygame.draw.circle(self.screen, warning, (sx, sy), pulse + 1)
+            pygame.draw.circle(self.screen, (255, 255, 255), (sx, sy), max(3, pulse - 4), 1)
             if spec.contact:
                 pygame.draw.circle(self.screen, CYAN, (sx, sy), pulse + 4, 1)
-            pygame.draw.circle(self.screen, YELLOW, (sx, sy), self._world_size(spec.blast_radius * progress, 1), 1)
+            blast_px = self._world_size(spec.blast_radius, 1)
+            phase = snapshot.time * 5.2 + progress * 3.4
+            ring_alpha = int(36 + progress * 64)
+            ring = pygame.Surface((blast_px * 2 + 20, blast_px * 2 + 20), pygame.SRCALPHA)
+            center = (blast_px + 10, blast_px + 10)
+            pygame.draw.circle(ring, (255, 214, 122, ring_alpha), center, blast_px, 1)
+            pygame.draw.circle(ring, (255, 145, 96, max(10, ring_alpha - 24)), center, int(blast_px * (0.55 + 0.35 * progress)), 1)
+            self.screen.blit(ring, (sx - center[0], sy - center[1]))
+            shard_count = 10 if grenade.kind == "heavy_grenade" else 7 if grenade.kind == "grenade" else 5
+            for index in range(shard_count):
+                angle = phase + math.tau * index / shard_count
+                inner = blast_px * (0.42 + 0.08 * math.sin(phase + index * 0.7))
+                outer = blast_px * (0.92 + 0.09 * math.cos(phase * 1.2 + index))
+                x1 = int(sx + math.cos(angle) * inner)
+                y1 = int(sy + math.sin(angle) * inner)
+                x2 = int(sx + math.cos(angle) * outer)
+                y2 = int(sy + math.sin(angle) * outer)
+                shard_color = (255, 196, 124) if grenade.kind != "heavy_grenade" else (255, 154, 108)
+                pygame.draw.line(self.screen, shard_color, (x1, y1), (x2, y2), 2 if grenade.kind == "heavy_grenade" else 1)
 
     def _draw_mines(self, snapshot: WorldSnapshot, camera: Vec2) -> None:
         player = self._local_player(snapshot)
@@ -1306,14 +1547,16 @@ class GameApp:
             sx, sy = self._world_to_screen(mine.pos, camera)
             if not (-180 <= sx <= SCREEN_W + 180 and -180 <= sy <= SCREEN_H + 180):
                 continue
-            base_color = MINE_MAP_COLOR if mine.armed else (132, 112, 166)
+            tier = self._mine_tier(mine.kind)
+            tier_name = self._mine_tier_label(tier)
+            base_color = self._mine_tier_color(tier, mine.armed)
             blink = 0.5 + 0.5 * math.sin(snapshot.time * 7.2 + mine.rotation)
             alpha = int((72 if mine.armed else 42) + blink * (70 if mine.armed else 18))
             self._draw_dashed_circle((sx, sy), self._world_size(mine.trigger_radius, 8), base_color, mine.rotation, alpha)
-            glow = pygame.Surface((58, 58), pygame.SRCALPHA)
-            pygame.draw.circle(glow, (*base_color, 44 if mine.armed else 24), (29, 29), 28)
-            self.screen.blit(glow, (sx - 29, sy - 29))
-            radius = self._world_size(18, 10)
+            glow = pygame.Surface((74, 74), pygame.SRCALPHA)
+            pygame.draw.circle(glow, (*base_color, 54 if mine.armed else 26), (37, 37), 34)
+            self.screen.blit(glow, (sx - 37, sy - 37))
+            radius = self._world_size(17 + tier * 2, 10)
             points = [
                 (int(sx + math.cos(mine.rotation - math.pi / 2) * radius), int(sy + math.sin(mine.rotation - math.pi / 2) * radius)),
                 (int(sx + math.cos(mine.rotation + math.pi * 0.16) * radius), int(sy + math.sin(mine.rotation + math.pi * 0.16) * radius)),
@@ -1326,6 +1569,10 @@ class GameApp:
                 pygame.draw.circle(self.screen, RED, (sx, sy), 5)
             if not self._draw_item_icon(mine.kind, pygame.Rect(sx - 12, sy - 12, 24, 24)):
                 pygame.draw.circle(self.screen, BG, (sx, sy), 4)
+            level_rect = pygame.Rect(sx - 14, sy + self._world_size(24, 16), 28, 14)
+            pygame.draw.rect(self.screen, (8, 12, 20), level_rect, border_radius=4)
+            pygame.draw.rect(self.screen, base_color, level_rect, 1, border_radius=4)
+            self._draw_text_fit(tier_name, level_rect.inflate(-2, -2), base_color, self.small, center=True)
 
     def _draw_dashed_circle(
         self,
@@ -1458,19 +1705,22 @@ class GameApp:
         half_angle = math.radians((module.cone_degrees if module else 58) * 0.5)
         sx, sy = self._world_to_screen(player.pos, camera)
         cone = pygame.Surface((SCREEN_W, SCREEN_H), pygame.SRCALPHA)
-        layers = 9 if soft else 4
+        flicker = 0.95 + 0.05 * math.sin(time.time() * 33.0 + player.pos.x * 0.0017)
+        layers = 13 if soft else 6
         for index in range(layers, 0, -1):
             ratio = index / layers
-            distance = int(cone_range * ratio)
-            spread = half_angle * (0.76 + 0.24 * ratio)
-            alpha = int((44 if soft else 118) * (1.0 - ratio * 0.62))
+            distance = int(cone_range * ratio * flicker)
+            spread = half_angle * (0.68 + 0.32 * ratio)
+            alpha = int((56 if soft else 124) * (1.0 - ratio * 0.58) * flicker)
             points = [
                 (sx, sy),
                 (int(sx + math.cos(player.angle - spread) * distance), int(sy + math.sin(player.angle - spread) * distance)),
                 (int(sx + math.cos(player.angle + spread) * distance), int(sy + math.sin(player.angle + spread) * distance)),
             ]
-            pygame.draw.polygon(cone, (255, 238, 168, max(5, alpha)), points)
-        pygame.draw.circle(cone, (255, 244, 184, 28), (sx, sy), self._world_size(130, 24))
+            pygame.draw.polygon(cone, (255, 236, 164, max(8, alpha)), points)
+        hot_radius = self._world_size(108, 22)
+        pygame.draw.circle(cone, (255, 248, 196, 62), (sx, sy), hot_radius)
+        pygame.draw.circle(cone, (255, 255, 236, 36), (sx, sy), max(12, int(hot_radius * 0.46)))
         self.screen.blit(cone, (0, 0))
 
     def _draw_tunnel_darkness(self, player: PlayerState, camera: Vec2) -> None:
@@ -1478,26 +1728,27 @@ class GameApp:
             return
         has_flashlight = self._has_active_flashlight(player)
         darkness = pygame.Surface((SCREEN_W, SCREEN_H), pygame.SRCALPHA)
-        darkness.fill((0, 0, 0, 232 if not has_flashlight else 206))
+        darkness.fill((0, 0, 0, 228 if not has_flashlight else 198))
         if has_flashlight:
             module = WEAPON_MODULES.get("flashlight_module")
             cone_range = self._world_size(module.cone_range if module else 620, 1)
             half_angle = math.radians((module.cone_degrees if module else 58) * 0.5)
             sx, sy = self._world_to_screen(player.pos, camera)
             light = pygame.Surface((SCREEN_W, SCREEN_H), pygame.SRCALPHA)
-            layers = 10
+            flicker = 0.94 + 0.06 * math.sin(time.time() * 32.0 + player.pos.y * 0.0021)
+            layers = 14
             for index in range(layers, 0, -1):
                 ratio = index / layers
-                distance = int(cone_range * ratio)
-                spread = half_angle * (0.72 + 0.28 * ratio)
-                alpha = int(160 * (1.0 - ratio * 0.72))
+                distance = int(cone_range * ratio * flicker)
+                spread = half_angle * (0.66 + 0.34 * ratio)
+                alpha = int(170 * (1.0 - ratio * 0.68) * flicker)
                 points = [
                     (sx, sy),
                     (int(sx + math.cos(player.angle - spread) * distance), int(sy + math.sin(player.angle - spread) * distance)),
                     (int(sx + math.cos(player.angle + spread) * distance), int(sy + math.sin(player.angle + spread) * distance)),
                 ]
                 pygame.draw.polygon(light, (0, 0, 0, max(8, alpha)), points)
-            pygame.draw.circle(light, (0, 0, 0, 138), (sx, sy), self._world_size(128, 24))
+            pygame.draw.circle(light, (0, 0, 0, 126), (sx, sy), self._world_size(142, 24))
             darkness.blit(light, (0, 0), special_flags=pygame.BLEND_RGBA_SUB)
         self.screen.blit(darkness, (0, 0))
         label = self.tr("hud.dark_flashlight" if not has_flashlight else "hud.dark")
@@ -1557,8 +1808,23 @@ class GameApp:
     def _draw_hud(self, snapshot: WorldSnapshot, player: PlayerState | None) -> None:
         if not player:
             return
-        pygame.draw.rect(self.screen, PANEL, pygame.Rect(18, 18, 348, 132), border_radius=8)
-        self._draw_text(player.name, 74, 30, TEXT, self.mid)
+        panel = pygame.Rect(18, 18, 348, 132)
+        pygame.draw.rect(self.screen, PANEL, panel, border_radius=8)
+        glow = pygame.Surface((panel.w + 8, panel.h + 8), pygame.SRCALPHA)
+        pygame.draw.rect(glow, (66, 118, 182, 28), glow.get_rect(), border_radius=10)
+        self.screen.blit(glow, (panel.x - 4, panel.y - 4))
+        panel_pulse = 0.5 + 0.5 * math.sin(snapshot.time * 3.1)
+        pygame.draw.rect(self.screen, (80, 140, 210), panel, 1, border_radius=8)
+        pulse_glow = pygame.Surface((panel.w + 14, panel.h + 14), pygame.SRCALPHA)
+        pygame.draw.rect(
+            pulse_glow,
+            (110, 184, 255, int(58 + panel_pulse * 34)),
+            pulse_glow.get_rect(),
+            1,
+            border_radius=12,
+        )
+        self.screen.blit(pulse_glow, (panel.x - 7, panel.y - 7))
+        self._draw_text(player.name, 74, 30, TEXT, self.hud_title_font)
         critical = player.alive and player.health < 25
         pulse = (math.sin(time.time() * 8.0) + 1.0) * 0.5 if critical else 0.0
         heart_size = 24 + int(7 * pulse if critical else 0)
@@ -1569,9 +1835,23 @@ class GameApp:
             self.screen.blit(glow, (14, 50))
         if not self._draw_item_icon("heart", heart_rect):
             pygame.draw.circle(self.screen, RED, (42, 78), 9)
+        regen_active = player.healing_left > 0.0 and player.healing_pool > 0.0
+        if regen_active:
+            self._regen_target_health = min(100.0, player.health + player.healing_pool)
+        elif self._regen_target_health is not None and player.health >= self._regen_target_health - 0.15:
+            self._regen_target_health = max(player.health, self._regen_target_health)
         health_color = (255, int(72 + pulse * 72), int(82 + pulse * 28)) if critical else RED
+        if self._regen_target_health is not None and player.health >= self._regen_target_health - 0.15:
+            health_color = (132, 22, 34)
         if critical:
             pygame.draw.rect(self.screen, (122, 0, 18), pygame.Rect(58, 66, 278, 24), 2, border_radius=7)
+        if self._regen_target_health is not None and self._regen_target_health > player.health + 0.1:
+            start_x = 62 + int(270 * max(0.0, min(1.0, player.health / 100.0)))
+            target_w = int(270 * max(0.0, min(1.0, (self._regen_target_health - player.health) / 100.0)))
+            if target_w > 0:
+                regen_rect = pygame.Rect(start_x, 70, target_w, 16)
+                pygame.draw.rect(self.screen, (74, 16, 28), regen_rect, border_radius=4)
+                pygame.draw.rect(self.screen, (108, 28, 40), regen_rect, 1, border_radius=4)
         self._bar(62, 70, 270, 16, player.health / 100.0, health_color)
         if player.poison_left > 0:
             poison_alpha = int(90 + 70 * ((math.sin(time.time() * 5.5) + 1.0) * 0.5))
@@ -1583,16 +1863,13 @@ class GameApp:
             pygame.draw.rect(self.screen, CYAN, pygame.Rect(34, 91, 18, 18), 2, border_radius=3)
         self._bar(62, 97, 270, 12, player.armor / armor_max, CYAN)
         self._draw_text(f"{self.tr('hud.score')} {player.score}   {self.tr('hud.medkits')} {player.medkits}", 34, 116, MUTED, self.small)
-        if player.poison_left > 0:
-            self._draw_text_fit(self.tr("hud.poisoned"), pygame.Rect(242, 116, 96, 18), GREEN, self.small, center=True)
-            badge = pygame.Rect(SCREEN_W - 86, 150, 58, 58)
-            pygame.draw.rect(self.screen, PANEL, badge, border_radius=10)
-            pygame.draw.rect(self.screen, GREEN, badge, 2, border_radius=10)
-            pygame.draw.circle(self.screen, (42, 124, 44), badge.center, 16)
-            pygame.draw.circle(self.screen, (130, 255, 124), badge.center, 9)
         noise_w = min(270, int(player.noise / 900 * 270))
         pygame.draw.rect(self.screen, (33, 40, 58), pygame.Rect(62, 134, 270, 5), border_radius=2)
         pygame.draw.rect(self.screen, YELLOW if player.sprinting else GREEN, pygame.Rect(62, 134, noise_w, 5), border_radius=2)
+        noise_sheen = pygame.Rect(62, 134, max(0, min(270, noise_w // 3)), 5)
+        if noise_sheen.w > 0:
+            pygame.draw.rect(self.screen, (245, 248, 255), noise_sheen, 1, border_radius=2)
+        self._draw_status_effects_bar(player)
 
         start_x = 380
         y = SCREEN_H - 72
@@ -1601,6 +1878,11 @@ class GameApp:
             active = slot == player.active_slot
             pygame.draw.rect(self.screen, PANEL_2 if active else PANEL, rect, border_radius=8)
             pygame.draw.rect(self.screen, CYAN if active else (47, 61, 91), rect, 2, border_radius=8)
+            if active:
+                glow = pygame.Surface((rect.w + 10, rect.h + 10), pygame.SRCALPHA)
+                alpha = int(52 + (0.5 + 0.5 * math.sin(snapshot.time * 7.0 + index)) * 66)
+                pygame.draw.rect(glow, (86, 226, 255, alpha), glow.get_rect(), 2, border_radius=10)
+                self.screen.blit(glow, (rect.x - 5, rect.y - 5))
             label = slot
             weapon = player.weapons.get(slot)
             quick_item = player.quick_items.get(slot)
@@ -1615,12 +1897,35 @@ class GameApp:
                 self._draw_item_icon(quick_item.key, pygame.Rect(rect.x + 22, rect.y + 6, 28, 28))
             self._draw_text_fit(label, rect.inflate(-10, -12), TEXT if weapon or quick_item else MUTED, self.small, center=True)
         self._draw_weapon_widget(player)
+
+    def _draw_status_effects_bar(self, player: PlayerState) -> None:
+        effects: list[tuple[str, str, tuple[int, int, int], float]] = []
+        if player.poison_left > 0.0:
+            effects.append(("poisoned", self.tr("hud.poisoned"), (95, 220, 122), player.poison_left))
+        if not effects:
+            return
+        width = max(180, len(effects) * 76 + 24)
+        panel = pygame.Rect((SCREEN_W - width) // 2, 16, width, 64)
+        pygame.draw.rect(self.screen, (12, 18, 30), panel, border_radius=10)
+        pygame.draw.rect(self.screen, (72, 98, 138), panel, 2, border_radius=10)
+        pulse = (math.sin(time.time() * 6.2) + 1.0) * 0.5
+        for index, (icon_key, title, color, left_seconds) in enumerate(effects):
+            icon_cell = pygame.Rect(panel.x + 14 + index * 76, panel.y + 10, 56, 44)
+            pygame.draw.rect(self.screen, PANEL, icon_cell, border_radius=9)
+            pygame.draw.rect(self.screen, color, icon_cell, 2, border_radius=9)
+            glow = pygame.Surface(icon_cell.inflate(10, 10).size, pygame.SRCALPHA)
+            pygame.draw.rect(glow, (*color, int(24 + pulse * 58)), glow.get_rect(), 1, border_radius=11)
+            self.screen.blit(glow, icon_cell.inflate(10, 10))
+            self._draw_item_icon(icon_key, icon_cell.inflate(-11, -8), aura=False, shadow=False)
+            self._draw_text_fit(f"{left_seconds:.1f}s", pygame.Rect(icon_cell.x, icon_cell.bottom - 14, icon_cell.w, 12), color, self.small, center=True)
+            label_rect = pygame.Rect(icon_cell.right + 8, icon_cell.y + 6, panel.right - icon_cell.right - 16, 30)
+            self._draw_text_fit(title, label_rect, color, self.small)
         self._draw_notice(player)
 
     def _draw_weapon_widget(self, player: PlayerState) -> None:
         weapon = player.active_weapon()
         quick_item = player.quick_items.get(player.active_slot)
-        rect = pygame.Rect(SCREEN_W - 322, SCREEN_H - 168, 300, 86)
+        rect = pygame.Rect(22, SCREEN_H - 168, 300, 86)
         rarity = weapon.rarity if weapon else quick_item.rarity if quick_item else "common"
         accent = rarity_color(rarity) if weapon or quick_item else MUTED
         pulse = (math.sin(time.time() * 5.6) + 1.0) * 0.5
@@ -1654,9 +1959,80 @@ class GameApp:
             ammo = "--"
             subtitle = self._floor_label(player.floor)
             pygame.draw.circle(self.screen, MUTED, icon_rect.center, 14, 2)
-        self._draw_text_fit(title, pygame.Rect(rect.x + 88, rect.y + 14, 160, 22), TEXT, self.font)
+        self._draw_text_fit(title, pygame.Rect(rect.x + 88, rect.y + 14, 160, 22), TEXT, self.hud_title_font)
         self._draw_text_fit(subtitle, pygame.Rect(rect.x + 88, rect.y + 38, 120, 18), accent, self.small)
-        self._draw_text_fit(ammo, pygame.Rect(rect.right - 86, rect.y + 52, 64, 24), YELLOW if weapon or quick_item else MUTED, self.mid, center=True)
+        self._draw_text_fit(ammo, pygame.Rect(rect.right - 86, rect.y + 52, 64, 24), YELLOW if weapon or quick_item else MUTED, self.hud_value_font, center=True)
+
+    def _mine_tier(self, mine_kind: str) -> int:
+        if "heavy" in mine_kind:
+            return 3
+        if "light" in mine_kind:
+            return 1
+        return 2
+
+    def _mine_tier_label(self, tier: int) -> str:
+        return "I" if tier <= 1 else "II" if tier == 2 else "III"
+
+    def _mine_tier_color(self, tier: int, armed: bool) -> tuple[int, int, int]:
+        if tier <= 1:
+            return (86, 208, 172) if armed else (88, 136, 124)
+        if tier == 2:
+            return (145, 116, 228) if armed else (122, 112, 160)
+        return (255, 128, 98) if armed else (164, 118, 108)
+
+    def _update_explosion_effects(self, snapshot: WorldSnapshot, player: PlayerState | None) -> None:
+        now = time.time()
+        current_grenades: dict[str, tuple[Vec2, int, str]] = {
+            grenade.id: (grenade.pos.copy(), grenade.floor, grenade.kind) for grenade in snapshot.grenades.values()
+        }
+        current_mines: dict[str, tuple[Vec2, int, str]] = {
+            mine.id: (mine.pos.copy(), mine.floor, mine.kind) for mine in snapshot.mines.values()
+        }
+        for grenade_id, (pos, floor, kind) in self._prev_grenade_state.items():
+            if grenade_id in current_grenades:
+                continue
+            spec = GRENADE_SPECS.get(kind, DEFAULT_GRENADE)
+            self._explosion_effects.append(
+                {"pos": pos, "floor": floor, "radius": spec.blast_radius, "color": (255, 168, 118), "start": now, "duration": 0.34},
+            )
+        for mine_id, (pos, floor, kind) in self._prev_mine_state.items():
+            if mine_id in current_mines:
+                continue
+            spec = MINE_SPECS.get(kind, DEFAULT_MINE)
+            self._explosion_effects.append(
+                {"pos": pos, "floor": floor, "radius": spec.blast_radius, "color": (212, 140, 255), "start": now, "duration": 0.36},
+            )
+        self._prev_grenade_state = current_grenades
+        self._prev_mine_state = current_mines
+        self._explosion_effects = [
+            fx for fx in self._explosion_effects if now - float(fx["start"]) <= float(fx["duration"]) + 0.04
+        ]
+
+    def _draw_explosion_effects(self, camera: Vec2, player: PlayerState | None) -> None:
+        now = time.time()
+        for fx in self._explosion_effects:
+            if player and int(fx["floor"]) != player.floor:
+                continue
+            pos = fx["pos"]
+            sx, sy = self._world_to_screen(pos, camera)
+            radius = self._world_size(float(fx["radius"]), 1)
+            age = max(0.0, min(1.0, (now - float(fx["start"])) / max(0.01, float(fx["duration"]))))
+            spike = 1.0 - age
+            color = fx["color"]
+            flash_radius = int(radius * (0.18 + age * 0.86))
+            blast = pygame.Surface((flash_radius * 2 + 48, flash_radius * 2 + 48), pygame.SRCALPHA)
+            center = (blast.get_width() // 2, blast.get_height() // 2)
+            pygame.draw.circle(blast, (*color, int(84 * spike)), center, max(12, flash_radius))
+            pygame.draw.circle(blast, (255, 238, 210, int(120 * spike)), center, max(8, int(flash_radius * 0.55)))
+            pygame.draw.circle(blast, (*color, int(66 * spike)), center, max(10, int(flash_radius * 1.16)), 2)
+            self.screen.blit(blast, (sx - center[0], sy - center[1]))
+
+            ring = pygame.Surface((radius * 2 + 20, radius * 2 + 20), pygame.SRCALPHA)
+            rc = (radius + 10, radius + 10)
+            ring_r = int(radius * (0.38 + age * 0.8))
+            pygame.draw.circle(ring, (*color, int(58 * spike)), rc, max(12, ring_r), 2)
+            pygame.draw.circle(ring, (255, 222, 178, int(48 * spike)), rc, max(8, int(ring_r * 0.72)), 1)
+            self.screen.blit(ring, (sx - rc[0], sy - rc[1]))
 
     def _minimap_rect(self) -> pygame.Rect:
         size = 248 if self.minimap_big else 176
@@ -1921,9 +2297,15 @@ class GameApp:
         xs = [panel.x + 42, panel.x + 286, panel.x + 350, panel.x + 426, panel.x + 506, panel.x + 586, panel.x + 666, panel.x + 746, panel.x + 832]
         for x, header in zip(xs, headers):
             self._draw_text(header, x, panel.y + 112, CYAN if header == self.tr("scoreboard.total") else MUTED, self.small)
-        y = panel.y + 150
+        viewport = pygame.Rect(panel.x + 22, panel.y + 146, panel.w - 44, panel.h - 176)
+        previous_clip = self.screen.get_clip()
+        self.screen.set_clip(viewport)
+        y = panel.y + 150 - self.scoreboard_scroll
         for player in sorted(snapshot.players.values(), key=lambda p: p.score, reverse=True):
             row = pygame.Rect(panel.x + 30, y - 8, panel.w - 60, 42)
+            if not row.colliderect(viewport.inflate(0, 24)):
+                y += 52
+                continue
             row_color = (28, 42, 66) if player.alive else (48, 20, 31)
             border = GREEN if player.alive else RED
             if player.id == (self.local_player_id or self.online.player_id):
@@ -1950,7 +2332,7 @@ class GameApp:
                 f"{player.name}{'' if player.alive else ' - ' + self.tr('state.dead')}",
                 pygame.Rect(name_x, y, xs[1] - name_x - 12, 22),
                 TEXT if player.alive else RED,
-                self.font,
+                self.emphasis_font if player.id == (self.local_player_id or self.online.player_id) else self.font,
             )
             for index, (x, value) in enumerate(zip(xs[1:], values), start=1):
                 if index == len(values):
@@ -1972,6 +2354,8 @@ class GameApp:
                     color = RED
                 self._draw_text_fit(value, pygame.Rect(x, y, 66, 22), color, self.font)
             y += 52
+        self.screen.set_clip(previous_clip)
+        self._draw_scoreboard_scrollbar(snapshot, viewport)
 
     def _draw_death_overlay(self) -> None:
         overlay = pygame.Surface((SCREEN_W, SCREEN_H), pygame.SRCALPHA)
@@ -1992,9 +2376,13 @@ class GameApp:
         panel = self._backpack_panel_rect()
         pygame.draw.rect(self.screen, PANEL, panel, border_radius=10)
         pygame.draw.rect(self.screen, CYAN, panel, 2, border_radius=10)
+        pulse = (math.sin(time.time() * 4.0) + 1.0) * 0.5
+        highlight = pygame.Surface(panel.inflate(18, 18).size, pygame.SRCALPHA)
+        pygame.draw.rect(highlight, (98, 184, 255, int(18 + pulse * 36)), highlight.get_rect(), 1, border_radius=12)
+        self.screen.blit(highlight, panel.inflate(18, 18))
         self._draw_text(self.tr("backpack.title"), panel.x + 34, panel.y + 24, TEXT, self.big)
         self._draw_text(self.tr("backpack.body"), panel.x + 54, panel.y + 116, PURPLE, self.mid)
-        self._draw_text(self.tr("backpack.help"), panel.x + 358, panel.y + 46, MUTED, self.small)
+        self._draw_text_fit(self.tr("backpack.help"), pygame.Rect(panel.x + 352, panel.y + 42, panel.w - 390, 40), MUTED, self.small)
 
         self._draw_text(self.tr("backpack.quickbar"), 390, 106, CYAN, self.mid)
         for index, slot in enumerate(SLOTS):
@@ -2061,7 +2449,13 @@ class GameApp:
             pygame.draw.circle(self.screen, (255, 255, 255), rect.center, min(rect.w, rect.h) // 4, 1)
         self._draw_rarity_badge(rect, rarity)
         title = self.weapon_title(key) if key in WEAPONS else self.item_title(key)
-        self._draw_text(title[:12], rect.x + 6, rect.y + rect.h - 20, color if rarity_highlight else TEXT, self.small)
+        self._draw_text_fit(
+            title,
+            pygame.Rect(rect.x + 4, rect.y + rect.h - 20, rect.w - 8, 16),
+            color if rarity_highlight else TEXT,
+            self.small,
+            center=True,
+        )
         if amount > 1:
             self._draw_text(str(amount), rect.right - 26, rect.bottom - 36, YELLOW, self.small)
 
@@ -2238,7 +2632,8 @@ class GameApp:
         pygame.draw.rect(self.screen, PURPLE, panel, 2, border_radius=10)
         self._draw_text_fit(self.tr("weaponmods.title"), pygame.Rect(panel.x + 28, panel.y + 18, 420, 44), TEXT, self.mid)
         self._draw_text_fit(self.tr("weaponmods.click_install"), pygame.Rect(panel.x + 32, panel.y + 54, 560, 20), MUTED, self.small)
-        self._draw_button(self._weapon_custom_close_rect(), self.tr("weaponmods.close"), False)
+        close_rect = self._weapon_custom_close_rect()
+        self._draw_button(close_rect, self.tr("weaponmods.close"), close_rect.collidepoint(self._mouse_pos()))
 
         self._draw_text(self.tr("weaponmods.weapon"), panel.x + 34, panel.y + 76, MUTED, self.small)
         for index, slot in enumerate(SLOTS):
@@ -2265,20 +2660,20 @@ class GameApp:
             self._draw_text_fit(self.tr("weaponmods.empty"), empty.inflate(-40, -40), MUTED, self.font, center=True)
             return
         mag_size = self._client_weapon_magazine_size(weapon)
-        info = pygame.Rect(panel.x + 34, panel.y + 164, 292, 210)
+        info = pygame.Rect(panel.x + 34, panel.y + 164, 312, 210)
         pygame.draw.rect(self.screen, (12, 17, 29), info, border_radius=10)
         pygame.draw.rect(self.screen, rarity_color(weapon.rarity), info, 2, border_radius=10)
-        weapon_rect = pygame.Rect(info.x + 18, info.y + 34, 104, 88)
+        weapon_rect = pygame.Rect(info.x + 16, info.y + 34, 94, 88)
         self._draw_rarity_frame(weapon_rect, weapon.rarity)
         self._draw_rarity_badge(weapon_rect, weapon.rarity, compact=True)
         self._draw_item_icon(weapon.key, weapon_rect.inflate(-14, -18))
         self._draw_text_fit(
             f"{self.rarity_title(weapon.rarity)} {self.weapon_title(weapon.key)}",
-            pygame.Rect(info.x + 136, info.y + 34, 138, 34),
+            pygame.Rect(info.x + 120, info.y + 34, 178, 34),
             rarity_color(weapon.rarity),
             self.font,
         )
-        self._draw_text_fit(f"{self.tr('weaponmods.magazine')}: {mag_size}", pygame.Rect(info.x + 136, info.y + 78, 130, 18), MUTED, self.small)
+        self._draw_text_fit(f"{self.tr('weaponmods.magazine')}: {mag_size}", pygame.Rect(info.x + 120, info.y + 78, 178, 18), MUTED, self.small)
         utility_title = self.item_title(weapon.modules["utility"]) if weapon.modules.get("utility") else self.tr("weaponmods.empty_slot")
         magazine_title = self.item_title(weapon.modules["magazine"]) if weapon.modules.get("magazine") else self.tr("weaponmods.empty_slot")
         self._draw_text_fit(f"{self.tr('weaponmods.slot.utility')}: {utility_title}", pygame.Rect(info.x + 20, info.y + 142, 250, 18), TEXT, self.small)
@@ -2312,8 +2707,16 @@ class GameApp:
 
         self._draw_text(self.tr("weaponmods.available"), panel.x + 34, panel.y + 388, TEXT, self.mid)
         self._draw_text_fit(self.tr("weaponmods.click_install"), pygame.Rect(panel.x + 250, panel.y + 396, 490, 18), MUTED, self.small)
+        viewport = self._weapon_module_viewport_rect()
+        self.weapon_modules_scroll = max(0, min(self._weapon_modules_max_scroll(), self.weapon_modules_scroll))
+        pygame.draw.rect(self.screen, (9, 13, 23), viewport.inflate(10, 10), border_radius=10)
+        pygame.draw.rect(self.screen, (42, 57, 82), viewport.inflate(10, 10), 1, border_radius=10)
+        previous_clip = self.screen.get_clip()
+        self.screen.set_clip(viewport)
         for module_key, indices in self._available_module_groups(player):
             rect = self._available_module_rect(module_key)
+            if not rect.colliderect(viewport.inflate(20, 20)):
+                continue
             module = WEAPON_MODULES[module_key]
             available = len(indices)
             installed_here = weapon.modules.get(module.slot) == module_key
@@ -2332,6 +2735,8 @@ class GameApp:
             self._draw_text_fit(self._module_effect_text(module_key), pygame.Rect(rect.x + 76, rect.y + 44, rect.w - 88, 18), GREEN if available else MUTED, self.small)
             count_text = self.tr("weaponmods.installed") if installed_here and not available else f"x{available}"
             self._draw_text_fit(count_text, pygame.Rect(rect.x + 76, rect.y + 68, rect.w - 88, 18), CYAN if installed_here else YELLOW if available else MUTED, self.small)
+        self.screen.set_clip(previous_clip)
+        self._draw_weapon_modules_scrollbar()
 
     def _client_weapon_magazine_size(self, weapon: object) -> int:
         base = WEAPONS[weapon.key].magazine_size
@@ -2358,6 +2763,10 @@ class GameApp:
         panel = self._settings_panel_rect()
         pygame.draw.rect(self.screen, PANEL, panel, border_radius=10)
         pygame.draw.rect(self.screen, CYAN, panel, 2, border_radius=10)
+        pulse = (math.sin(time.time() * 3.0) + 1.0) * 0.5
+        glow = pygame.Surface(panel.inflate(20, 20).size, pygame.SRCALPHA)
+        pygame.draw.rect(glow, (76, 225, 255, int(20 + pulse * 40)), glow.get_rect(), 1, border_radius=12)
+        self.screen.blit(glow, panel.inflate(20, 20))
         title = self.tr("settings.title") if panel_only else self.tr("settings.pause")
         self._draw_text_fit(title, pygame.Rect(panel.x + 34, panel.y + 24, panel.w - 68, 58), TEXT, self.big)
         self._draw_text(self.tr("settings.caption"), panel.x + 38, panel.y + 88, MUTED, self.small)
@@ -2386,36 +2795,241 @@ class GameApp:
             display_name += "|"
         self._draw_text_fit(display_name, pygame.Rect(name_rect.x + 168, name_rect.y + 11, name_rect.w - 184, 20), TEXT, self.font)
 
+        viewport = pygame.Rect(option_x, start_y, option_width, panel.h - 250)
+        previous_clip = self.screen.get_clip()
+        self.screen.set_clip(viewport)
         for index, key in enumerate(self.settings):
-            rect = pygame.Rect(option_x, start_y + index * step_y, option_width, option_height)
+            rect = pygame.Rect(option_x, start_y + index * step_y - self.pause_settings_scroll, option_width, option_height)
             pygame.draw.rect(self.screen, PANEL_2, rect, border_radius=8)
             pygame.draw.rect(self.screen, GREEN if self.settings[key] else MUTED, rect, 2, border_radius=8)
             marker = self.tr("state.on") if self.settings[key] else self.tr("state.off")
             self._draw_text_fit(labels[key], pygame.Rect(rect.x + 16, rect.y + 12, rect.w - 100, 20), TEXT, self.font)
             self._draw_text(marker, rect.right - 70, rect.y + 12, GREEN if self.settings[key] else RED, self.font)
 
-        density_rect = pygame.Rect(option_x, start_y + len(self.settings) * step_y, option_width, option_height)
-        pygame.draw.rect(self.screen, PANEL_2, density_rect, border_radius=8)
-        pygame.draw.rect(self.screen, YELLOW, density_rect, 2, border_radius=8)
-        self._draw_text_fit(self.tr("settings.bot_density"), pygame.Rect(density_rect.x + 16, density_rect.y + 12, density_rect.w - 140, 20), TEXT, self.font)
-        self._draw_text_fit(self.tr(f"density.{self.bot_density}"), pygame.Rect(density_rect.right - 130, density_rect.y + 12, 114, 20), YELLOW, self.font)
+        camera_rect = pygame.Rect(option_x, start_y + len(self.settings) * step_y - self.pause_settings_scroll, option_width, option_height)
+        pygame.draw.rect(self.screen, PANEL_2, camera_rect, border_radius=8)
+        pygame.draw.rect(self.screen, (134, 196, 255), camera_rect, 2, border_radius=8)
+        self._draw_text_fit(
+            self.tr("settings.camera_distance"),
+            pygame.Rect(camera_rect.x + 16, camera_rect.y + 12, camera_rect.w - 170, 20),
+            TEXT,
+            self.font,
+        )
+        camera_mode = (
+            "settings.camera_distance.near"
+            if self.camera_distance >= 0.97
+            else "settings.camera_distance.far"
+            if self.camera_distance <= 0.86
+            else "settings.camera_distance.normal"
+        )
+        self._draw_text_fit(self.tr(camera_mode), pygame.Rect(camera_rect.right - 146, camera_rect.y + 12, 130, 20), CYAN, self.font)
 
-        difficulty_rect = pygame.Rect(option_x, start_y + (len(self.settings) + 1) * step_y, option_width, option_height)
-        pygame.draw.rect(self.screen, PANEL_2, difficulty_rect, border_radius=8)
-        pygame.draw.rect(self.screen, PURPLE, difficulty_rect, 2, border_radius=8)
-        self._draw_text_fit(self.tr("settings.difficulty"), pygame.Rect(difficulty_rect.x + 16, difficulty_rect.y + 12, difficulty_rect.w - 150, 20), TEXT, self.font)
-        self._draw_text_fit(self.tr(f"difficulty.{self.difficulty_key}"), pygame.Rect(difficulty_rect.right - 140, difficulty_rect.y + 12, 124, 20), PURPLE, self.font)
-
-        language_rect = pygame.Rect(option_x, start_y + (len(self.settings) + 2) * step_y, option_width, option_height)
+        language_rect = pygame.Rect(option_x, start_y + (len(self.settings) + 1) * step_y - self.pause_settings_scroll, option_width, option_height)
         pygame.draw.rect(self.screen, PANEL_2, language_rect, border_radius=8)
         pygame.draw.rect(self.screen, CYAN, language_rect, 2, border_radius=8)
         self._draw_text_fit(self.tr("settings.language"), pygame.Rect(language_rect.x + 16, language_rect.y + 12, language_rect.w - 90, 20), TEXT, self.font)
         self._draw_text(self.language.upper(), language_rect.right - 70, language_rect.y + 12, CYAN, self.font)
+        self.screen.set_clip(previous_clip)
+        self._draw_pause_settings_scrollbar(viewport)
         if panel_only:
-            self._draw_button(self._settings_back_rect(), self.tr("settings.back"), False)
+            back_rect = self._settings_back_rect()
+            self._draw_button(back_rect, self.tr("settings.back"), back_rect.collidepoint(self._mouse_pos()))
         else:
-            self._draw_button(self._settings_resume_rect(), self.tr("settings.resume"), False)
-            self._draw_button(self._settings_main_menu_rect(), self.tr("settings.main_menu"), False)
+            resume_rect = self._settings_resume_rect()
+            menu_rect = self._settings_main_menu_rect()
+            mouse = self._mouse_pos()
+            self._draw_button(resume_rect, self.tr("settings.resume"), resume_rect.collidepoint(mouse))
+            self._draw_button(menu_rect, self.tr("settings.main_menu"), menu_rect.collidepoint(mouse))
+
+    def _draw_settings_hub(self, in_game: bool = False) -> None:
+        if in_game:
+            overlay = pygame.Surface((SCREEN_W, SCREEN_H), pygame.SRCALPHA)
+            overlay.fill((1, 3, 8, 166))
+            self.screen.blit(overlay, (0, 0))
+        panel = self._settings_panel_rect()
+        pygame.draw.rect(self.screen, PANEL, panel, border_radius=12)
+        pygame.draw.rect(self.screen, CYAN, panel, 2, border_radius=12)
+        self._draw_text_fit(self.tr("settings.title"), pygame.Rect(panel.x + 32, panel.y + 26, panel.w - 64, 44), TEXT, self.big, center=True)
+        tab_y = panel.y + 106
+        for index, tab in enumerate(self.settings_tabs):
+            rect = pygame.Rect(panel.x + 32 + index * 112, tab_y, 102, 36)
+            active = tab == self.settings_tab
+            pulse = (math.sin(time.time() * 5.0 + index) + 1.0) * 0.5
+            pygame.draw.rect(self.screen, PANEL_2 if active else (16, 22, 34), rect, border_radius=9)
+            pygame.draw.rect(self.screen, CYAN if active else (68, 86, 120), rect, 2, border_radius=9)
+            if active:
+                glow = pygame.Surface(rect.inflate(10, 10).size, pygame.SRCALPHA)
+                pygame.draw.rect(glow, (86, 226, 255, int(28 + pulse * 44)), glow.get_rect(), 1, border_radius=11)
+                self.screen.blit(glow, rect.inflate(10, 10))
+            locale_key = next((tab_item.locale_key for tab_item in SETTINGS_TABS if tab_item.key == tab), f"settings.tab.{tab}")
+            self._draw_text_fit(self.tr(locale_key), rect.inflate(-8, -8), TEXT if active else MUTED, self.small, center=True)
+        if tab_is_stub(self.settings_tab):
+            stub = pygame.Rect(panel.x + 40, panel.y + 168, panel.w - 80, panel.h - 250)
+            pygame.draw.rect(self.screen, (12, 18, 30), stub, border_radius=10)
+            pygame.draw.rect(self.screen, PURPLE, stub, 2, border_radius=10)
+            self._draw_text_fit(self.tr("settings.audio.stub"), stub.inflate(-20, -30), CYAN, self.big, center=True)
+            if in_game:
+                resume_rect = self._settings_resume_rect()
+                menu_rect = self._settings_main_menu_rect()
+                mouse = self._mouse_pos()
+                self._draw_button(resume_rect, self.tr("settings.resume"), resume_rect.collidepoint(mouse))
+                self._draw_button(menu_rect, self.tr("settings.main_menu"), menu_rect.collidepoint(mouse))
+            else:
+                self._draw_button(self._settings_back_rect(), self.tr("settings.back"), self._settings_back_rect().collidepoint(self._mouse_pos()))
+            return
+        viewport = pygame.Rect(panel.x + 36, panel.y + 162, panel.w - 72, panel.h - 238)
+        pygame.draw.rect(self.screen, (10, 16, 28), viewport.inflate(8, 8), border_radius=10)
+        pygame.draw.rect(self.screen, (56, 74, 108), viewport.inflate(8, 8), 1, border_radius=10)
+        options = tab_toggle_keys(self.settings_tab)
+        labels = {
+            "bot_vision": self.tr("settings.bot_vision"),
+            "bot_vision_range": self.tr("settings.bot_vision_range"),
+            "ai_reactions": self.tr("settings.ai_reactions"),
+            "health_bars": self.tr("settings.health_bars"),
+            "noise_radius": self.tr("settings.noise_radius"),
+            "show_zombie_count": self.tr("settings.show_zombie_count"),
+            "fullscreen": self.tr("settings.fullscreen"),
+        }
+        step_y = 56
+        option_h = 44
+        option_x = viewport.x + 6
+        option_w = viewport.w - 24
+        previous_clip = self.screen.get_clip()
+        self.screen.set_clip(viewport)
+        for index, key in enumerate(options):
+            y = viewport.y + index * step_y - self.options_scroll
+            rect = pygame.Rect(option_x, y, option_w, option_h)
+            hovered = rect.collidepoint(self._mouse_pos())
+            marker = self.tr("state.on") if self.settings[key] else self.tr("state.off")
+            pygame.draw.rect(self.screen, PANEL_2 if hovered else PANEL, rect, border_radius=9)
+            pygame.draw.rect(self.screen, GREEN if self.settings[key] else MUTED, rect, 2, border_radius=9)
+            if hovered:
+                glow = pygame.Surface(rect.inflate(12, 12).size, pygame.SRCALPHA)
+                pulse = (math.sin(time.time() * 8.0 + index) + 1.0) * 0.5
+                pygame.draw.rect(glow, (100, 196, 255, int(18 + pulse * 50)), glow.get_rect(), 1, border_radius=11)
+                self.screen.blit(glow, rect.inflate(12, 12))
+            self._draw_text_fit(labels[key], pygame.Rect(rect.x + 14, rect.y + 12, rect.w - 120, 20), TEXT, self.font)
+            self._draw_text_fit(marker, pygame.Rect(rect.right - 88, rect.y + 10, 76, 22), GREEN if self.settings[key] else RED, self.emphasis_font, center=True)
+        row_index = len(options)
+        if tab_has_camera_distance(self.settings_tab):
+            camera_rect = pygame.Rect(option_x, viewport.y + row_index * step_y - self.options_scroll, option_w, option_h)
+            pygame.draw.rect(self.screen, PANEL_2, camera_rect, border_radius=9)
+            pygame.draw.rect(self.screen, CYAN, camera_rect, 2, border_radius=9)
+            camera_mode = "settings.camera_distance.near" if self.camera_distance >= 0.97 else "settings.camera_distance.far" if self.camera_distance <= 0.86 else "settings.camera_distance.normal"
+            self._draw_text_fit(self.tr("settings.camera_distance"), pygame.Rect(camera_rect.x + 14, camera_rect.y + 12, camera_rect.w - 180, 20), TEXT, self.font)
+            self._draw_text_fit(self.tr(camera_mode), pygame.Rect(camera_rect.right - 154, camera_rect.y + 12, 140, 20), CYAN, self.hud_title_font, center=True)
+            row_index += 1
+        if tab_has_language(self.settings_tab):
+            language_rect = pygame.Rect(option_x, viewport.y + row_index * step_y - self.options_scroll, option_w, option_h)
+            pygame.draw.rect(self.screen, PANEL_2, language_rect, border_radius=9)
+            pygame.draw.rect(self.screen, PURPLE, language_rect, 2, border_radius=9)
+            self._draw_text_fit(self.tr("settings.language"), pygame.Rect(language_rect.x + 14, language_rect.y + 12, language_rect.w - 180, 20), TEXT, self.font)
+            self._draw_text_fit(self.language.upper(), pygame.Rect(language_rect.right - 154, language_rect.y + 12, 140, 20), PURPLE, self.hud_title_font, center=True)
+        self.screen.set_clip(previous_clip)
+        self._draw_options_scrollbar(viewport, row_index + (1 if tab_has_language(self.settings_tab) else 0), step_y)
+        if in_game:
+            resume_rect = self._settings_resume_rect()
+            menu_rect = self._settings_main_menu_rect()
+            mouse = self._mouse_pos()
+            self._draw_button(resume_rect, self.tr("settings.resume"), resume_rect.collidepoint(mouse))
+            self._draw_button(menu_rect, self.tr("settings.main_menu"), menu_rect.collidepoint(mouse))
+        else:
+            self._draw_button(self._settings_back_rect(), self.tr("settings.back"), self._settings_back_rect().collidepoint(self._mouse_pos()))
+
+    def _draw_options_scrollbar(self, viewport: pygame.Rect, rows: int, step_y: int) -> None:
+        content_h = rows * step_y
+        max_scroll = max(0, content_h - viewport.h)
+        if max_scroll <= 0:
+            self.options_scroll = 0
+            return
+        track = pygame.Rect(viewport.right + 10, viewport.y, 10, viewport.h)
+        pygame.draw.rect(self.screen, (10, 16, 28), track, border_radius=5)
+        pygame.draw.rect(self.screen, (58, 76, 108), track, 1, border_radius=5)
+        knob_h = max(42, int(track.h * track.h / max(track.h, content_h)))
+        knob_y = track.y + int((track.h - knob_h) * (self.options_scroll / max_scroll))
+        knob = pygame.Rect(track.x + 2, knob_y, track.w - 4, knob_h)
+        pygame.draw.rect(self.screen, CYAN, knob, border_radius=4)
+        pygame.draw.rect(self.screen, (214, 246, 255), knob, 1, border_radius=4)
+
+    def _scroll_options(self, direction: int) -> None:
+        if tab_is_stub(self.settings_tab):
+            self.options_scroll = 0
+            return
+        viewport_h = self._settings_panel_rect().h - 238
+        row_count = len(tab_toggle_keys(self.settings_tab))
+        if tab_has_camera_distance(self.settings_tab):
+            row_count += 1
+        if tab_has_language(self.settings_tab):
+            row_count += 1
+        content_h = row_count * 56
+        max_scroll = max(0, content_h - viewport_h)
+        self.options_scroll = max(0, min(max_scroll, self.options_scroll + direction * 34))
+
+    def _scroll_pause_settings(self, direction: int) -> None:
+        viewport_h = self._settings_panel_rect().h - 238
+        content_h = (len(tab_toggle_keys("video")) + 2) * 56
+        max_scroll = max(0, content_h - viewport_h)
+        self.pause_settings_scroll = max(0, min(max_scroll, self.pause_settings_scroll + direction * 34))
+
+    def _draw_pause_settings_scrollbar(self, viewport: pygame.Rect) -> None:
+        content_h = (len(tab_toggle_keys("video")) + 2) * 56
+        max_scroll = max(0, content_h - viewport.h)
+        if max_scroll <= 0:
+            self.pause_settings_scroll = 0
+            return
+        track = pygame.Rect(viewport.right + 10, viewport.y, 10, viewport.h)
+        pygame.draw.rect(self.screen, (10, 16, 28), track, border_radius=5)
+        pygame.draw.rect(self.screen, (58, 76, 108), track, 1, border_radius=5)
+        knob_h = max(42, int(track.h * track.h / max(track.h, content_h)))
+        knob_y = track.y + int((track.h - knob_h) * (self.pause_settings_scroll / max_scroll))
+        knob = pygame.Rect(track.x + 2, knob_y, track.w - 4, knob_h)
+        pygame.draw.rect(self.screen, CYAN, knob, border_radius=4)
+        pygame.draw.rect(self.screen, (214, 246, 255), knob, 1, border_radius=4)
+
+    def _handle_single_setup_click(self, pos: tuple[int, int]) -> None:
+        panel = pygame.Rect((SCREEN_W - 660) // 2, 120, 660, 500)
+        back_rect = pygame.Rect(panel.x + 56, panel.bottom - 72, 230, 46)
+        start_rect = pygame.Rect(panel.right - 286, panel.bottom - 72, 230, 46)
+        if back_rect.collidepoint(pos):
+            self.single_map_dropdown_open = False
+            self.state = "menu"
+            return
+        if start_rect.collidepoint(pos):
+            self.single_map_dropdown_open = False
+            self._start_single_player()
+            return
+        rows = [
+            pygame.Rect(panel.x + 56, panel.y + 130, panel.w - 112, 50),
+            pygame.Rect(panel.x + 56, panel.y + 200, panel.w - 112, 50),
+            pygame.Rect(panel.x + 56, panel.y + 270, panel.w - 112, 50),
+            pygame.Rect(panel.x + 56, panel.y + 340, panel.w - 112, 50),
+        ]
+        if rows[0].collidepoint(pos):
+            self.single_map_dropdown_open = not self.single_map_dropdown_open
+            return
+        if self.single_map_dropdown_open:
+            popup = pygame.Rect(rows[0].x, rows[0].bottom + 6, rows[0].w, 120)
+            item = pygame.Rect(popup.x + 10, popup.y + 10, popup.w - 30, 30)
+            if item.collidepoint(pos):
+                self.single_map_key = MAP_OPTIONS[0]
+                self._save_client_settings()
+            self.single_map_dropdown_open = False
+            if popup.collidepoint(pos):
+                return
+        else:
+            self.single_map_dropdown_open = False
+        if rows[1].collidepoint(pos):
+            if not self.single_bots_enabled:
+                return
+            idx = self.difficulty_options.index(self.difficulty_key)
+            self.difficulty_key = self.difficulty_options[(idx + 1) % len(self.difficulty_options)]
+        elif rows[2].collidepoint(pos):
+            self.single_bots_enabled = not self.single_bots_enabled
+        elif rows[3].collidepoint(pos):
+            if not self.single_bots_enabled:
+                return
+            self.bot_density = DENSITY_ORDER[(DENSITY_ORDER.index(self.bot_density) + 1) % len(DENSITY_ORDER)]
+        self._save_client_settings()
 
     def _backpack_rect(self, index: int) -> pygame.Rect:
         col = index % 6
@@ -2455,10 +3069,53 @@ class GameApp:
         return pygame.Rect(panel.x + 360, panel.y + 316, 496, 58)
 
     def _available_module_rect(self, module_key: str) -> pygame.Rect:
-        panel = self._weapon_custom_panel_rect()
+        viewport = self._weapon_module_viewport_rect()
         order = {key: index for index, key in enumerate(WEAPON_MODULES)}
         index = order.get(module_key, 0)
-        return pygame.Rect(panel.x + 34 + index * 226, panel.y + 414, 210, 96)
+        cols = 2
+        gap_x = 14
+        gap_y = 12
+        card_w = (viewport.w - gap_x) // cols
+        card_h = 96
+        row = index // cols
+        col = index % cols
+        return pygame.Rect(
+            viewport.x + col * (card_w + gap_x),
+            viewport.y + row * (card_h + gap_y) - self.weapon_modules_scroll,
+            card_w,
+            card_h,
+        )
+
+    def _weapon_module_viewport_rect(self) -> pygame.Rect:
+        panel = self._weapon_custom_panel_rect()
+        return pygame.Rect(panel.x + 34, panel.y + 424, panel.w - 86, 126)
+
+    def _weapon_modules_content_height(self) -> int:
+        card_h = 96
+        gap_y = 12
+        rows = max(1, math.ceil(len(WEAPON_MODULES) / 2))
+        return rows * card_h + max(0, rows - 1) * gap_y
+
+    def _weapon_modules_max_scroll(self) -> int:
+        return max(0, self._weapon_modules_content_height() - self._weapon_module_viewport_rect().h)
+
+    def _scroll_weapon_modules(self, direction: int) -> None:
+        self.weapon_modules_scroll = max(0, min(self._weapon_modules_max_scroll(), self.weapon_modules_scroll + direction * 40))
+
+    def _draw_weapon_modules_scrollbar(self) -> None:
+        viewport = self._weapon_module_viewport_rect()
+        track = pygame.Rect(viewport.right + 8, viewport.y, 10, viewport.h)
+        pygame.draw.rect(self.screen, (8, 12, 20), track, border_radius=5)
+        pygame.draw.rect(self.screen, (52, 68, 98), track, 1, border_radius=5)
+        max_scroll = self._weapon_modules_max_scroll()
+        if max_scroll <= 0:
+            pygame.draw.rect(self.screen, PURPLE, track.inflate(-2, -2), border_radius=4)
+            return
+        knob_h = max(38, int(track.h * track.h / max(track.h, self._weapon_modules_content_height())))
+        knob_y = track.y + int((track.h - knob_h) * (self.weapon_modules_scroll / max_scroll))
+        knob = pygame.Rect(track.x + 2, knob_y, track.w - 4, knob_h)
+        pygame.draw.rect(self.screen, PURPLE, knob, border_radius=4)
+        pygame.draw.rect(self.screen, (236, 222, 255), knob, 1, border_radius=4)
 
     def _equipment_rect(self, slot: str) -> pygame.Rect:
         order = {"head": 0, "torso": 1, "arms": 2, "legs": 3}
@@ -2479,8 +3136,9 @@ class GameApp:
                     return {"source": "weapon_module", "slot": weapon_slot, "module_slot": module_slot}
             if self._weapon_module_return_rect().collidepoint(pos):
                 return {"source": "module_return"}
+            viewport = self._weapon_module_viewport_rect()
             for module_key, indices in self._available_module_groups(player):
-                if indices and self._available_module_rect(module_key).collidepoint(pos):
+                if indices and viewport.collidepoint(pos) and self._available_module_rect(module_key).collidepoint(pos):
                     return {"source": "backpack", "index": indices[0]}
         for index, slot in enumerate(SLOTS):
             if self._quick_rect(index).collidepoint(pos):
@@ -2524,7 +3182,7 @@ class GameApp:
     def _settings_grid(self) -> tuple[int, int]:
         panel = self._settings_panel_rect()
         start_y = panel.y + 166
-        step_y = 40
+        step_y = 56
         return start_y, step_y
 
     def _settings_name_rect(self) -> pygame.Rect:
@@ -2615,6 +3273,10 @@ class GameApp:
             return f"{self.tr('weaponmods.accuracy')} x{module.spread_multiplier:.2f}"
         if module.key == "flashlight_module":
             return f"{int(module.cone_range)} {self.tr('weaponmods.light')}"
+        if module.key == "silencer":
+            return "noise 0, spread +8%"
+        if module.key == "compensator":
+            return "fire rate+, spread -5%, noise +12%"
         if module.key == "extended_mag":
             bonus = int(round((module.magazine_multiplier - 1.0) * 100))
             return f"+{bonus}% {self.tr('weaponmods.magazine')}"
@@ -2790,15 +3452,13 @@ class GameApp:
         return self.tr("item.medicine")
 
     def _draw_button(self, rect: pygame.Rect, label: str, hovered: bool) -> None:
-        # Create modern button with gradient and shadow effects
+        pulse = (math.sin(time.time() * 5.0 + rect.x * 0.01) + 1.0) * 0.5
         if hovered:
-            # Draw shadow for hovered state
             shadow_rect = rect.move(2, 3)
             shadow_surface = pygame.Surface((shadow_rect.w, shadow_rect.h), pygame.SRCALPHA)
             pygame.draw.rect(shadow_surface, (0, 0, 0, 60), shadow_surface.get_rect(), border_radius=10)
             self.screen.blit(shadow_surface, shadow_rect)
 
-            # Draw gradient background for hover
             gradient_surface = pygame.Surface((rect.w, rect.h), pygame.SRCALPHA)
             for i in range(rect.h):
                 alpha = 255 - (i * 40 // rect.h)
@@ -2806,22 +3466,49 @@ class GameApp:
                 pygame.draw.line(gradient_surface, color, (0, i), (rect.w, i))
             self.screen.blit(gradient_surface, rect)
 
-            # Draw main button
             pygame.draw.rect(self.screen, (40, 55, 85), rect, border_radius=10)
             pygame.draw.rect(self.screen, CYAN, rect, 3, border_radius=10)
-
-            # Add inner glow
             inner_rect = rect.inflate(-6, -6)
             pygame.draw.rect(self.screen, (76, 225, 255, 30), inner_rect, 2, border_radius=8)
         else:
-            # Normal state
             pygame.draw.rect(self.screen, PANEL, rect, border_radius=10)
             pygame.draw.rect(self.screen, (53, 68, 98), rect, 2, border_radius=10)
+        pulse_glow = pygame.Surface(rect.inflate(12, 12).size, pygame.SRCALPHA)
+        pygame.draw.rect(pulse_glow, (88, 204, 255, int(12 + pulse * 34)), pulse_glow.get_rect(), 1, border_radius=12)
+        self.screen.blit(pulse_glow, rect.inflate(12, 12))
 
         # Draw text with better positioning
         text_color = TEXT if hovered else (200, 210, 230)
         font = self.mid if hovered else self.font
         self._draw_text_fit(label, rect.inflate(-24, -12), text_color, font, center=True)
+
+    def _scoreboard_max_scroll(self, snapshot: WorldSnapshot) -> int:
+        rows = len(snapshot.players)
+        content_h = rows * 52
+        viewport_h = 520 - 176
+        return max(0, content_h - viewport_h + 12)
+
+    def _scroll_scoreboard(self, direction: int) -> None:
+        snapshot = self._snapshot()
+        if not snapshot:
+            return
+        max_scroll = self._scoreboard_max_scroll(snapshot)
+        self.scoreboard_scroll = max(0, min(max_scroll, self.scoreboard_scroll + direction * 36))
+
+    def _draw_scoreboard_scrollbar(self, snapshot: WorldSnapshot, viewport: pygame.Rect) -> None:
+        max_scroll = self._scoreboard_max_scroll(snapshot)
+        if max_scroll <= 0:
+            self.scoreboard_scroll = 0
+            return
+        track = pygame.Rect(viewport.right + 6, viewport.y, 10, viewport.h)
+        pygame.draw.rect(self.screen, (10, 16, 28), track, border_radius=5)
+        pygame.draw.rect(self.screen, (58, 76, 108), track, 1, border_radius=5)
+        knob_h = max(42, int(track.h * track.h / max(track.h, len(snapshot.players) * 52)))
+        knob_y = track.y + int((track.h - knob_h) * (self.scoreboard_scroll / max_scroll))
+        knob = pygame.Rect(track.x + 2, knob_y, track.w - 4, knob_h)
+        pulse = (math.sin(time.time() * 5.5) + 1.0) * 0.5
+        pygame.draw.rect(self.screen, (86, 228, 255), knob, border_radius=4)
+        pygame.draw.rect(self.screen, (210, 250, 255, int(110 + pulse * 100)), knob, 1, border_radius=4)
 
     def _draw_text(
         self,
