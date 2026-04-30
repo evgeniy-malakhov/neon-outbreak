@@ -505,6 +505,7 @@ class ProjectileState:
     life: float
     radius: float = 5.0
     floor: int = 0
+    weapon_key: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -516,6 +517,7 @@ class ProjectileState:
             "life": round(self.life, 3),
             "radius": self.radius,
             "floor": self.floor,
+            "weapon_key": self.weapon_key,
         }
 
     @classmethod
@@ -529,6 +531,7 @@ class ProjectileState:
             life=float(data.get("life", 0.0)),
             radius=float(data.get("radius", 5.0)),
             floor=int(data.get("floor", 0)),
+            weapon_key=str(data.get("weapon_key", "")),
         )
 
 

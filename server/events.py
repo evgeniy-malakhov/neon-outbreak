@@ -67,8 +67,10 @@ def _append_new_projectiles(events: list[dict[str, Any]], previous: dict[str, An
                 "tick": tick,
                 "projectile_id": projectile_id,
                 "owner_id": projectile.get("owner_id", ""),
+                "weapon_key": projectile.get("weapon_key", ""),
                 "x": pos.get("x", 0.0),
                 "y": pos.get("y", 0.0),
+                "floor": projectile.get("floor", 0),
             }
         )
 

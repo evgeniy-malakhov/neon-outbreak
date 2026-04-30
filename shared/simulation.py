@@ -1494,6 +1494,7 @@ class GameWorld:
                 damage=projectile_damage,
                 life=0.82,
                 floor=player.floor,
+                weapon_key=weapon.key,
             )
 
     def _unarmed_attack(self, player: PlayerState) -> None:

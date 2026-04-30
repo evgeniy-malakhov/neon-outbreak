@@ -39,5 +39,9 @@ def tab_has_language(tab_key: str) -> bool:
     return tab_key == "general"
 
 
+def tab_has_audio_sliders(tab_key: str) -> bool:
+    return tab_key == "audio"
+
+
 def tab_is_stub(tab_key: str) -> bool:
-    return tab_key in {"audio", "gameplay"}
+    return tab_key in {"gameplay"}

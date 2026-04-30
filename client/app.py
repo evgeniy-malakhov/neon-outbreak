@@ -9,9 +9,18 @@ from pathlib import Path
 
 import pygame
 
+from client.audio import AudioManager
+from client.audio_config import load_audio_tuning
 from client.death_effects import load_death_effect_tuning
 from client.network import OnlineClient, ping_server
-from client.settings_schema import SETTINGS_TABS, tab_has_camera_distance, tab_has_language, tab_is_stub, tab_toggle_keys
+from client.settings_schema import (
+    SETTINGS_TABS,
+    tab_has_audio_sliders,
+    tab_has_camera_distance,
+    tab_has_language,
+    tab_is_stub,
+    tab_toggle_keys,
+)
 from client.single_setup_schema import DENSITY_ORDER, MAP_OPTIONS
 from shared.constants import ARMORS, MAP_HEIGHT, MAP_WIDTH, SLOTS, WEAPONS, ZOMBIES
 from shared.crafting import craft_rarity_chances
@@ -137,10 +146,23 @@ class GameApp:
         self._death_effects: list[dict[str, object]] = []
         self._prev_zombie_death_state: dict[str, dict[str, object]] = {}
         self._prev_player_death_state: dict[str, dict[str, object]] = {}
+        self._prev_projectile_audio_state: dict[str, dict[str, object]] = {}
+        self._played_projectile_sounds: set[str] = set()
+        self._shot_sound_debounce: dict[str, float] = {}
+        self._prev_reload_audio_state: dict[str, float] = {}
+        self._last_empty_sound_at = 0.0
         self.scoreboard_scroll = 0
         saved_settings = self._load_client_settings()
         self.camera_distance = max(0.78, min(1.08, float(saved_settings.get("camera_distance", 0.92))))
         self.camera_zoom = self.camera_distance
+        self.audio_tuning = load_audio_tuning()
+        self.master_volume = self._read_volume(saved_settings, "master_volume", 0.8)
+        self.music_volume = self._read_volume(saved_settings, "music_volume", 0.55)
+        self.effects_volume = self._read_volume(saved_settings, "effects_volume", 0.8)
+        self.audio = AudioManager(self.audio_tuning.menu_music_path, self.audio_tuning.actions_dir)
+        self.audio.set_master_volume(self.master_volume)
+        self.audio.set_music_volume(self.music_volume)
+        self.audio.set_effects_volume(self.effects_volume)
         self.state = "menu"
         self.player_name = self._clean_player_name(str(saved_settings.get("player_name", "Operator")))
         self.name_editing = False
@@ -205,6 +227,7 @@ class GameApp:
         self.single_map_dropdown_open = False
         self.single_map_dropdown_alpha = 0.0
         self.single_map_scroll = 0
+        self._dragging_audio_slider: str | None = None
         self.server_entries: list[ServerEntry] = []
         self.selected_server = 0
         self._last_ping_refresh = 0.0
@@ -213,6 +236,7 @@ class GameApp:
         self._menu_buttons = self._create_menu_buttons()
         if self.settings["fullscreen"]:
             self._set_display_mode(True)
+        self._sync_menu_music()
 
     def _create_menu_buttons(self) -> list[Button]:
         """Create menu buttons with responsive positioning"""
@@ -249,11 +273,23 @@ class GameApp:
             return {}
         return data if isinstance(data, dict) else {}
 
+    def _read_volume(self, settings: dict[str, object], key: str, default: float) -> float:
+        try:
+            value = float(settings.get(key, default))
+        except (TypeError, ValueError):
+            value = default
+        if value > 1.0:
+            value /= 100.0
+        return max(0.0, min(1.0, value))
+
     def _save_client_settings(self) -> None:
         data = {
             "player_name": self.player_name,
             "language": self.language,
             "camera_distance": round(self.camera_distance, 3),
+            "master_volume": round(self.master_volume, 3),
+            "music_volume": round(self.music_volume, 3),
+            "effects_volume": round(self.effects_volume, 3),
             "single_difficulty": self.difficulty_key,
             "single_bot_density": self.bot_density,
             "single_bots_enabled": self.single_bots_enabled,
@@ -346,6 +382,7 @@ class GameApp:
         if self.world:
             self.world.close()
         self.online.close()
+        self.audio.close()
         pygame.quit()
 
     def _set_display_mode(self, fullscreen: bool) -> None:
@@ -410,6 +447,8 @@ class GameApp:
                 self._handle_mouse_down(event)
             elif event.type == pygame.MOUSEBUTTONUP:
                 self._handle_mouse_up(event)
+            elif event.type == pygame.MOUSEMOTION:
+                self._handle_mouse_motion(event)
             elif event.type == pygame.MOUSEWHEEL:
                 self._handle_mouse_wheel(event)
 
@@ -483,6 +522,9 @@ class GameApp:
 
     def _handle_mouse_down(self, event: pygame.event.Event) -> None:
         pos = self._display_to_screen(event.pos)
+        if event.button == 1 and self._settings_audio_active():
+            if self._begin_audio_slider_drag(pos):
+                return
         if self.weapon_custom_open and event.button in (4, 5):
             if self._weapon_module_viewport_rect().collidepoint(pos):
                 self._scroll_weapon_modules(-1 if event.button == 4 else 1)
@@ -523,6 +565,10 @@ class GameApp:
         if event.button != 1:
             return
         pos = self._display_to_screen(event.pos)
+        if self._dragging_audio_slider:
+            self._update_audio_slider_from_pos(self._dragging_audio_slider, pos, save=True)
+            self._dragging_audio_slider = None
+            return
         if self.settings_open:
             self._handle_settings_click(pos)
             return
@@ -580,6 +626,12 @@ class GameApp:
                     action["slot"] = self.drag_source["slot"]
                 self.pending_inventory_action = action
             self.drag_source = None
+
+    def _handle_mouse_motion(self, event: pygame.event.Event) -> None:
+        if not self._dragging_audio_slider:
+            return
+        pos = self._display_to_screen(event.pos)
+        self._update_audio_slider_from_pos(self._dragging_audio_slider, pos, save=False)
 
     def _handle_mouse_wheel(self, event: pygame.event.Event) -> None:
         if self.weapon_custom_open and self.backpack_open and self._weapon_module_viewport_rect().collidepoint(self._mouse_pos()):
@@ -663,6 +715,9 @@ class GameApp:
             return
         viewport = pygame.Rect(panel.x + 36, panel.y + 162, panel.w - 72, panel.h - 238)
         if not viewport.collidepoint(pos):
+            return
+        if tab_has_audio_sliders(self.settings_tab):
+            self._begin_audio_slider_drag(pos)
             return
         options = tab_toggle_keys(self.settings_tab)
         step_y = 56
@@ -766,6 +821,7 @@ class GameApp:
             self.pending_medkit = True
 
     def _update(self, dt: float) -> None:
+        self._sync_menu_music()
         target_dropdown = 1.0 if self.single_map_dropdown_open and self.state == "single_setup" else 0.0
         self.single_map_dropdown_alpha += (target_dropdown - self.single_map_dropdown_alpha) * min(1.0, dt * 8.0)
         if self.state == "servers" and time.time() - self._last_ping_refresh > 4.0:
@@ -792,6 +848,121 @@ class GameApp:
         self._update_camera_zoom(dt)
         self._update_damage_feedback(dt)
 
+    def _sync_menu_music(self) -> None:
+        self.audio.set_menu_music_active(self.state in {"menu", "options", "single_setup", "servers"})
+
+    def _maybe_play_empty_weapon_sound(self, player: PlayerState) -> None:
+        weapon = player.active_weapon()
+        if not weapon or weapon.ammo_in_mag > 0 or weapon.reserve_ammo > 0:
+            return
+        now = time.time()
+        if now - self._last_empty_sound_at < 0.34:
+            return
+        self._last_empty_sound_at = now
+        self._play_weapon_action_sound(weapon.key, "empty", player.pos, player.floor, local=True)
+
+    def _update_weapon_audio_from_snapshot(self, snapshot: WorldSnapshot) -> None:
+        current_projectiles: dict[str, dict[str, object]] = {}
+        for projectile in snapshot.projectiles.values():
+            current_projectiles[projectile.id] = {
+                "owner_id": projectile.owner_id,
+                "weapon_key": projectile.weapon_key,
+                "pos": projectile.pos.copy(),
+                "floor": projectile.floor,
+            }
+            if projectile.id not in self._prev_projectile_audio_state:
+                weapon_key = projectile.weapon_key or self._active_weapon_key(snapshot, projectile.owner_id)
+                self._play_shot_sound(projectile.owner_id, weapon_key, projectile.pos, projectile.floor, projectile.id)
+        self._prev_projectile_audio_state = current_projectiles
+        if len(self._played_projectile_sounds) > 2048:
+            self._played_projectile_sounds.clear()
+
+        current_reload: dict[str, float] = {}
+        for player in snapshot.players.values():
+            weapon = player.active_weapon()
+            reload_left = float(weapon.reload_left if weapon else 0.0)
+            current_reload[player.id] = reload_left
+            if weapon and reload_left > 0.0 and self._prev_reload_audio_state.get(player.id, 0.0) <= 0.0:
+                self._play_weapon_action_sound(weapon.key, "reload", player.pos, player.floor, local=player.id == (self.local_player_id or self.online.player_id))
+        self._prev_reload_audio_state = current_reload
+
+    def _play_shot_event(self, event: dict[str, object]) -> None:
+        projectile_id = str(event.get("projectile_id") or "")
+        owner_id = str(event.get("owner_id") or "")
+        weapon_key = str(event.get("weapon_key") or "")
+        if not weapon_key:
+            snapshot = self._snapshot()
+            weapon_key = self._active_weapon_key(snapshot, owner_id) if snapshot else "pistol"
+        try:
+            pos = Vec2(float(event.get("x", 0.0)), float(event.get("y", 0.0)))
+            floor = int(event.get("floor", 0))
+        except (TypeError, ValueError):
+            return
+        self._play_shot_sound(owner_id, weapon_key, pos, floor, projectile_id)
+
+    def _play_shot_sound(self, owner_id: str, weapon_key: str, pos: Vec2, floor: int, projectile_id: str = "") -> None:
+        if projectile_id and projectile_id in self._played_projectile_sounds:
+            return
+        if projectile_id:
+            self._played_projectile_sounds.add(projectile_id)
+        weapon_key = weapon_key if weapon_key in WEAPONS else "pistol"
+        now = time.time()
+        debounce_key = f"{owner_id}:{weapon_key}"
+        if now - self._shot_sound_debounce.get(debounce_key, -999.0) < 0.045:
+            return
+        self._shot_sound_debounce[debounce_key] = now
+        self._play_weapon_action_sound(weapon_key, "shot", pos, floor, local=owner_id == (self.local_player_id or self.online.player_id))
+
+    def _active_weapon_key(self, snapshot: WorldSnapshot | None, player_id: str) -> str:
+        player = snapshot.players.get(player_id) if snapshot else None
+        weapon = player.active_weapon() if player else None
+        return weapon.key if weapon else "pistol"
+
+    def _play_weapon_action_sound(self, weapon_key: str, action: str, pos: Vec2 | None, floor: int, *, local: bool = False) -> None:
+        sound_key = self._weapon_sound_key(weapon_key, action)
+        if not sound_key:
+            return
+        volume, pan = (1.0, 0.0) if local else self._spatial_sound_params(pos, floor)
+        if volume <= 0.0:
+            return
+        self.audio.play_action_sound(sound_key, volume=volume, pan=pan)
+
+    def _weapon_sound_key(self, weapon_key: str, action: str) -> str:
+        spec = self.audio_tuning.weapon_sounds.get(weapon_key)
+        if spec:
+            return getattr(spec, action, "")
+        if action == "shot":
+            return weapon_key if weapon_key else "pistol"
+        if action == "reload":
+            return "reload"
+        return "empty"
+
+    def _spatial_sound_params(self, pos: Vec2 | None, floor: int) -> tuple[float, float]:
+        if not pos:
+            return 1.0, 0.0
+        snapshot = self._snapshot()
+        listener = self._local_player(snapshot) if snapshot else None
+        if not listener:
+            return 1.0, 0.0
+        dx = pos.x - listener.pos.x
+        dy = pos.y - listener.pos.y
+        distance = math.hypot(dx, dy)
+        max_distance = max(1.0, float(self.audio_tuning.shot_hearing_distance))
+        full_distance = min(max_distance, max(0.0, float(self.audio_tuning.shot_full_volume_distance)))
+        if distance >= max_distance:
+            return 0.0, 0.0
+        if distance <= full_distance:
+            volume = 1.0
+        else:
+            ratio = (distance - full_distance) / max(1.0, max_distance - full_distance)
+            volume = max(0.0, (1.0 - ratio) ** 1.35)
+        if int(floor) != listener.floor:
+            volume *= max(0.0, float(self.audio_tuning.different_floor_volume_multiplier))
+        if volume < float(self.audio_tuning.min_spatial_volume):
+            return 0.0, 0.0
+        pan = max(-1.0, min(1.0, dx / max(240.0, max_distance * 0.42)))
+        return volume, pan
+
     def _handle_online_events(self) -> None:
         if self.state != "online_game":
             return
@@ -803,6 +974,9 @@ class GameApp:
             if kind == "player_joined":
                 if str(event.get("player_id", "")) != str(self.online.player_id or ""):
                     self._add_join_notification(str(event.get("name") or "Player"))
+                continue
+            if kind == "shot":
+                self._play_shot_event(event)
                 continue
             if kind == "zombie_killed":
                 self._add_zombie_death_from_event(event)
@@ -1004,6 +1178,8 @@ class GameApp:
         right_pressed = bool(mouse_buttons[2])
         left_pressed = bool(mouse_buttons[0])
         has_weapon = bool(player and player.active_weapon())
+        if player and left_pressed and not ui_open:
+            self._maybe_play_empty_weapon_sound(player)
         if player and right_pressed:
             to_mouse = Vec2(mouse_world.x - player.pos.x, mouse_world.y - player.pos.y)
             if to_mouse.length() > 20:
@@ -1088,6 +1264,11 @@ class GameApp:
         self._death_effects.clear()
         self._prev_zombie_death_state.clear()
         self._prev_player_death_state.clear()
+        self._prev_projectile_audio_state.clear()
+        self._played_projectile_sounds.clear()
+        self._shot_sound_debounce.clear()
+        self._prev_reload_audio_state.clear()
+        self._last_empty_sound_at = 0.0
 
     def _start_single_player(self) -> None:
         self.online.close()
@@ -1433,6 +1614,7 @@ class GameApp:
         if snapshot:
             self._update_explosion_effects(snapshot, player)
             self._update_death_effects(snapshot)
+            self._update_weapon_audio_from_snapshot(snapshot)
             self._draw_tunnels(snapshot, camera, player)
             self._draw_buildings(snapshot, camera, player)
             if player and self.settings["noise_radius"]:
@@ -3192,6 +3374,129 @@ class GameApp:
             self._draw_button(resume_rect, self.tr("settings.resume"), resume_rect.collidepoint(mouse))
             self._draw_button(menu_rect, self.tr("settings.main_menu"), menu_rect.collidepoint(mouse))
 
+    def _settings_footer_buttons(self, in_game: bool) -> None:
+        mouse = self._mouse_pos()
+        if in_game:
+            resume_rect = self._settings_resume_rect()
+            menu_rect = self._settings_main_menu_rect()
+            self._draw_button(resume_rect, self.tr("settings.resume"), resume_rect.collidepoint(mouse))
+            self._draw_button(menu_rect, self.tr("settings.main_menu"), menu_rect.collidepoint(mouse))
+        else:
+            back_rect = self._settings_back_rect()
+            self._draw_button(back_rect, self.tr("settings.back"), back_rect.collidepoint(mouse))
+
+    def _settings_audio_active(self) -> bool:
+        return self.settings_tab == "audio" and (self.state == "options" or (self.settings_open and self.state in {"single", "online_game"}))
+
+    def _audio_slider_layout(self, viewport: pygame.Rect) -> list[tuple[str, pygame.Rect, pygame.Rect]]:
+        option_x = viewport.x + 6
+        option_w = viewport.w - 24
+        row_h = 122
+        rows: list[tuple[str, pygame.Rect, pygame.Rect]] = []
+        for index, key in enumerate(("master", "music", "effects")):
+            card = pygame.Rect(option_x, viewport.y + index * row_h - self.options_scroll, option_w, 98)
+            track = pygame.Rect(card.x + 24, card.y + 68, card.w - 150, 10)
+            rows.append((key, card, track))
+        return rows
+
+    def _begin_audio_slider_drag(self, pos: tuple[int, int]) -> bool:
+        panel = self._settings_panel_rect()
+        viewport = pygame.Rect(panel.x + 36, panel.y + 162, panel.w - 72, panel.h - 238)
+        if not viewport.collidepoint(pos):
+            return False
+        for key, card, track in self._audio_slider_layout(viewport):
+            if card.collidepoint(pos) or track.inflate(16, 28).collidepoint(pos):
+                self._dragging_audio_slider = key
+                self._update_audio_slider_from_pos(key, pos, save=False)
+                return True
+        return False
+
+    def _update_audio_slider_from_pos(self, key: str, pos: tuple[int, int], *, save: bool) -> None:
+        panel = self._settings_panel_rect()
+        viewport = pygame.Rect(panel.x + 36, panel.y + 162, panel.w - 72, panel.h - 238)
+        track = next((track for row_key, _card, track in self._audio_slider_layout(viewport) if row_key == key), None)
+        if not track:
+            return
+        value = (pos[0] - track.x) / max(1, track.w)
+        self._set_audio_volume(key, value, save=save)
+
+    def _set_audio_volume(self, key: str, value: float, *, save: bool) -> None:
+        volume = max(0.0, min(1.0, float(value)))
+        if key == "master":
+            self.master_volume = volume
+            self.audio.set_master_volume(volume)
+        elif key == "music":
+            self.music_volume = volume
+            self.audio.set_music_volume(volume)
+        elif key == "effects":
+            self.effects_volume = volume
+            self.audio.set_effects_volume(volume)
+        if save:
+            self._save_client_settings()
+
+    def _draw_audio_settings(self, viewport: pygame.Rect) -> None:
+        previous_clip = self.screen.get_clip()
+        self.screen.set_clip(viewport)
+        for index, (key, card, track) in enumerate(self._audio_slider_layout(viewport)):
+            value = self.master_volume if key == "master" else self.music_volume if key == "music" else self.effects_volume
+            title_key = f"settings.audio.{key}"
+            desc_key = f"settings.audio.{key}.desc"
+            color = CYAN if key == "master" else PURPLE if key == "music" else YELLOW
+            self._draw_audio_slider_card(key, card, track, self.tr(title_key), self.tr(desc_key), value, color, index)
+        self.screen.set_clip(previous_clip)
+
+    def _draw_audio_slider_card(
+        self,
+        key: str,
+        card: pygame.Rect,
+        track: pygame.Rect,
+        title: str,
+        description: str,
+        value: float,
+        color: tuple[int, int, int],
+        index: int,
+    ) -> None:
+        mouse = self._mouse_pos()
+        hovered = card.collidepoint(mouse) or track.inflate(18, 30).collidepoint(mouse)
+        pulse = (math.sin(time.time() * 5.5 + index * 1.7) + 1.0) * 0.5
+        pygame.draw.rect(self.screen, PANEL_2 if hovered else PANEL, card, border_radius=12)
+        pygame.draw.rect(self.screen, color if hovered else (66, 82, 118), card, 2, border_radius=12)
+        if hovered or self._dragging_audio_slider == key:
+            glow = pygame.Surface(card.inflate(14, 14).size, pygame.SRCALPHA)
+            pygame.draw.rect(glow, (*color, int(20 + pulse * 44)), glow.get_rect(), 1, border_radius=14)
+            self.screen.blit(glow, card.inflate(14, 14))
+        self._draw_text_fit(title, pygame.Rect(card.x + 20, card.y + 12, card.w - 150, 22), TEXT, self.hud_title_font)
+        percent = f"{int(round(value * 100)):>3}%"
+        self._draw_text_fit(percent, pygame.Rect(card.right - 104, card.y + 12, 82, 24), color, self.hud_value_font, center=True)
+        self._draw_text_fit(description, pygame.Rect(card.x + 20, card.y + 38, card.w - 42, 20), MUTED, self.small)
+
+        pygame.draw.rect(self.screen, (8, 12, 22), track.inflate(0, 8), border_radius=8)
+        pygame.draw.rect(self.screen, (48, 62, 92), track, border_radius=5)
+        fill_w = int(track.w * value)
+        if fill_w > 0:
+            fill = pygame.Rect(track.x, track.y, fill_w, track.h)
+            for offset in range(fill.w):
+                ratio = offset / max(1, fill.w - 1)
+                segment_color = (
+                    int(72 + (color[0] - 72) * ratio),
+                    int(110 + (color[1] - 110) * ratio),
+                    int(142 + (color[2] - 142) * ratio),
+                )
+                pygame.draw.line(self.screen, segment_color, (fill.x + offset, fill.y), (fill.x + offset, fill.bottom - 1))
+            pygame.draw.rect(self.screen, color, fill, 1, border_radius=5)
+        knob_x = track.x + fill_w
+        knob_radius = 11 + (2 if hovered else 0)
+        pygame.draw.circle(self.screen, (6, 10, 18), (knob_x, track.centery), knob_radius + 4)
+        pygame.draw.circle(self.screen, color, (knob_x, track.centery), knob_radius)
+        pygame.draw.circle(self.screen, (236, 248, 255), (knob_x - 3, track.centery - 3), max(2, knob_radius // 3))
+
+        meter_x = card.right - 92
+        for bar in range(6):
+            bar_h = int(7 + value * (10 + bar * 3) + math.sin(time.time() * 4.0 + bar + index) * 2)
+            bar_rect = pygame.Rect(meter_x + bar * 9, track.y - 8 - bar_h, 5, max(3, bar_h))
+            alpha_color = color if bar / 6 <= value + 0.08 else (58, 72, 104)
+            pygame.draw.rect(self.screen, alpha_color, bar_rect, border_radius=2)
+
     def _draw_settings_hub(self, in_game: bool = False) -> None:
         if in_game:
             overlay = pygame.Surface((SCREEN_W, SCREEN_H), pygame.SRCALPHA)
@@ -3219,18 +3524,16 @@ class GameApp:
             pygame.draw.rect(self.screen, (12, 18, 30), stub, border_radius=10)
             pygame.draw.rect(self.screen, PURPLE, stub, 2, border_radius=10)
             self._draw_text_fit(self.tr("settings.audio.stub"), stub.inflate(-20, -30), CYAN, self.big, center=True)
-            if in_game:
-                resume_rect = self._settings_resume_rect()
-                menu_rect = self._settings_main_menu_rect()
-                mouse = self._mouse_pos()
-                self._draw_button(resume_rect, self.tr("settings.resume"), resume_rect.collidepoint(mouse))
-                self._draw_button(menu_rect, self.tr("settings.main_menu"), menu_rect.collidepoint(mouse))
-            else:
-                self._draw_button(self._settings_back_rect(), self.tr("settings.back"), self._settings_back_rect().collidepoint(self._mouse_pos()))
+            self._settings_footer_buttons(in_game)
             return
         viewport = pygame.Rect(panel.x + 36, panel.y + 162, panel.w - 72, panel.h - 238)
         pygame.draw.rect(self.screen, (10, 16, 28), viewport.inflate(8, 8), border_radius=10)
         pygame.draw.rect(self.screen, (56, 74, 108), viewport.inflate(8, 8), 1, border_radius=10)
+        if tab_has_audio_sliders(self.settings_tab):
+            self._draw_audio_settings(viewport)
+            self._draw_options_scrollbar(viewport, 3, 122)
+            self._settings_footer_buttons(in_game)
+            return
         options = tab_toggle_keys(self.settings_tab)
         labels = {
             "bot_vision": self.tr("settings.bot_vision"),
@@ -3278,14 +3581,7 @@ class GameApp:
             self._draw_text_fit(self.language.upper(), pygame.Rect(language_rect.right - 154, language_rect.y + 12, 140, 20), PURPLE, self.hud_title_font, center=True)
         self.screen.set_clip(previous_clip)
         self._draw_options_scrollbar(viewport, row_index + (1 if tab_has_language(self.settings_tab) else 0), step_y)
-        if in_game:
-            resume_rect = self._settings_resume_rect()
-            menu_rect = self._settings_main_menu_rect()
-            mouse = self._mouse_pos()
-            self._draw_button(resume_rect, self.tr("settings.resume"), resume_rect.collidepoint(mouse))
-            self._draw_button(menu_rect, self.tr("settings.main_menu"), menu_rect.collidepoint(mouse))
-        else:
-            self._draw_button(self._settings_back_rect(), self.tr("settings.back"), self._settings_back_rect().collidepoint(self._mouse_pos()))
+        self._settings_footer_buttons(in_game)
 
     def _draw_options_scrollbar(self, viewport: pygame.Rect, rows: int, step_y: int) -> None:
         content_h = rows * step_y
@@ -3307,7 +3603,7 @@ class GameApp:
             self.options_scroll = 0
             return
         viewport_h = self._settings_panel_rect().h - 238
-        row_count = len(tab_toggle_keys(self.settings_tab))
+        row_count = 3 if tab_has_audio_sliders(self.settings_tab) else len(tab_toggle_keys(self.settings_tab))
         if tab_has_camera_distance(self.settings_tab):
             row_count += 1
         if tab_has_language(self.settings_tab):

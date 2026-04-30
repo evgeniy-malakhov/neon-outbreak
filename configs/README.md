@@ -10,6 +10,7 @@ All files in this folder are UTF-8 JSON, except this documentation file. Restart
 - `rarities.json` configures item rarity colors and bonuses.
 - `explosives.json` configures thrown grenades and placed mines.
 - `weapon_modules.json` configures laser, flashlight and magazine modules.
+- `audio.json` configures menu music, action sound folders, weapon sound mapping and spatial shot falloff.
 - `crafting.json` configures crafted item rarity chances.
 - `backpack.json` configures the starting backpack.
 - `item_stacks.json` configures stack sizes for backpack items.
@@ -160,6 +161,20 @@ Higher rarity weapons and armor are shown with their rarity color on the map and
 - `corpse_dark_alpha`: darkness applied over dead zombie bodies.
 - `player_cross_size` / `player_cross_width`: black cross size and stroke width for dead players.
 - `max_effects`: maximum number of active local death effects kept by the client.
+
+## Audio
+
+`audio.json` keeps sound asset routing out of code:
+
+- `menu_music`: relative or absolute path to the menu music MP3.
+- `actions_dir`: folder containing short action sounds such as shots, reloads and empty weapon clicks.
+- `weapon_sounds`: per-weapon mapping for `shot`, `reload` and `empty` sound keys. Sound keys match filenames in `actions_dir` without extension.
+- `shot_hearing_distance`: maximum world distance where remote shots are audible.
+- `shot_full_volume_distance`: distance where shots still play at full volume before falloff begins.
+- `different_floor_volume_multiplier`: volume multiplier for sounds on another building floor.
+- `min_spatial_volume`: cutoff below which very quiet distant sounds are skipped.
+
+The client has three audio sliders: master volume affects every sound, music affects menu music, and effects affects shots, reloads and empty weapon clicks.
 
 ## Explosives
 
