@@ -87,8 +87,12 @@ class ServerEntry:
     port: int
     ping_ms: float | None = None
     players: int = 0
+    max_players: int = 0
+    ready: bool = False
     status: str = "checking"
     difficulty: str = "medium"
+    mode: str = "survival"
+    pvp: bool = False
 
 
 class GameApp:
@@ -880,7 +884,21 @@ class GameApp:
         if not path.exists():
             return [ServerEntry("Local Dev", "127.0.0.1", 8765)]
         data = json.loads(path.read_text(encoding="utf-8"))
-        return [ServerEntry(str(row["name"]), str(row["host"]), int(row["port"])) for row in data]
+        entries: list[ServerEntry] = []
+        for row in data:
+            if not isinstance(row, dict):
+                continue
+            mode = str(row.get("mode", "survival"))
+            entries.append(
+                ServerEntry(
+                    str(row["name"]),
+                    str(row["host"]),
+                    int(row["port"]),
+                    mode=mode,
+                    pvp=bool(row.get("pvp", False) or mode == "pvp"),
+                )
+            )
+        return entries
 
     def _refresh_pings(self) -> None:
         if self._pinging:
@@ -895,8 +913,12 @@ class GameApp:
                     ping, meta = ping_server(entry.host, entry.port)
                     entry.ping_ms = ping
                     entry.players = int(meta.get("players", 0)) if meta else 0
+                    entry.max_players = int(meta.get("max_players", 0)) if meta else 0
+                    entry.ready = bool(meta.get("ready", False)) if meta else False
                     entry.difficulty = str(meta.get("difficulty", entry.difficulty)) if meta else entry.difficulty
-                    entry.status = "online" if ping is not None else "offline"
+                    entry.mode = str(meta.get("mode", entry.mode)) if meta else entry.mode
+                    entry.pvp = bool(meta.get("pvp", entry.pvp) or entry.mode == "pvp") if meta else entry.pvp
+                    entry.status = "ready" if ping is not None and entry.ready else "online" if ping is not None else "offline"
             finally:
                 self._pinging = False
 
@@ -1016,13 +1038,21 @@ class GameApp:
             selected = index == self.selected_server
             pygame.draw.rect(self.screen, PANEL_2 if selected else PANEL, rect, border_radius=8)
             pygame.draw.rect(self.screen, CYAN if selected else (45, 59, 91), rect, 2, border_radius=8)
-            self._draw_text(entry.name, rect.x + 18, rect.y + 9, TEXT, self.mid)
+            self._draw_text_fit(entry.name, pygame.Rect(rect.x + 18, rect.y + 8, 160, 26), TEXT, self.mid)
+            mode_label = self.tr("servers.mode.pvp") if entry.pvp else self.tr("servers.mode.survival")
+            mode_color = RED if entry.pvp else GREEN
+            mode_rect = pygame.Rect(rect.x + 186, rect.y + 16, 62, 24)
+            pygame.draw.rect(self.screen, (12, 18, 30), mode_rect, border_radius=7)
+            pygame.draw.rect(self.screen, mode_color, mode_rect, 1, border_radius=7)
+            self._draw_text_fit(mode_label, mode_rect.inflate(-8, -4), mode_color, self.small, center=True)
             endpoint = f"{entry.host}:{entry.port}"
             ping = "offline" if entry.ping_ms is None else f"{entry.ping_ms:.0f} ms"
             difficulty = self.tr(f"difficulty.{entry.difficulty}") if entry.difficulty in self.difficulty_options else entry.difficulty
             self._draw_text(endpoint, rect.x + 260, rect.y + 18, MUTED)
-            status = f"{ping}  {self.tr('servers.players')}: {entry.players}  {self.tr('servers.difficulty')}: {difficulty}"
-            self._draw_text_fit(status, pygame.Rect(rect.x + 485, rect.y + 18, 210, 22), GREEN if entry.ping_ms else RED, self.small)
+            players = f"{entry.players}/{entry.max_players}" if entry.max_players else str(entry.players)
+            readiness = self.tr("servers.ready") if entry.ready else self.tr("servers.not_ready") if entry.ping_ms is not None else self.tr("servers.offline")
+            status = f"{ping}  {players}  {readiness}" if entry.pvp else f"{ping}  {players}  {readiness}  {difficulty}"
+            self._draw_text_fit(status, pygame.Rect(rect.x + 485, rect.y + 18, 210, 22), GREEN if entry.ready else YELLOW if entry.ping_ms else RED, self.small)
         self._draw_button(pygame.Rect(72, 632, 180, 46), self.tr("servers.back"), False)
         self._draw_button(pygame.Rect(270, 632, 180, 46), self.tr("servers.refresh"), False)
         self._draw_button(pygame.Rect(470, 632, 180, 46), self.tr("servers.connect"), False)

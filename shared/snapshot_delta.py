@@ -50,10 +50,26 @@ def apply_snapshot_delta(base: dict[str, Any], delta: dict[str, Any]) -> dict[st
         for entity_id in patch.get("r", []):
             target.pop(str(entity_id), None)
         for entity_id, entity in patch.get("u", {}).items():
-            target[str(entity_id)] = entity
+            key = str(entity_id)
+            if isinstance(entity, dict) and isinstance(target.get(key), dict):
+                target[key] = _merge_entity(target[key], entity)
+            else:
+                target[key] = entity
     return merged
 
 
 def _collection(snapshot: dict[str, Any], key: str) -> dict[str, Any]:
     value = snapshot.get(key, {})
     return value if isinstance(value, dict) else {}
+
+
+def _merge_entity(current: dict[str, Any], patch: dict[str, Any]) -> dict[str, Any]:
+    merged = dict(current)
+    for key, value in patch.items():
+        if key == "weapons" and isinstance(value, dict) and isinstance(merged.get(key), dict):
+            weapons = dict(merged[key])
+            weapons.update(value)
+            merged[key] = weapons
+        else:
+            merged[key] = value
+    return merged

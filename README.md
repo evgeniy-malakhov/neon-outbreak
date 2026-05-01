@@ -27,6 +27,7 @@ Top-down shooter prototype in Python with a shared simulation core for single-pl
 - Optimized TCP protocol based on asyncio Protocol, length-prefixed frames, optional msgpack encoding, per-client output queues, logical reliable/unreliable channels, interest filtering and compact delta snapshots.
 - Online netcode supports input acknowledgement, client-side prediction, reconciliation and interpolation buffering for smoother remote entities.
 - Gameplay events are streamed separately from state snapshots for effects such as shots, hits, deaths, explosions, pickups and transactional command results.
+- Headless fake-client load tests in `load_tests/` cover movement, reliable commands, reconnect/resume, packet delay and server metrics.
 
 ## Install
 
@@ -56,6 +57,12 @@ Start the server in a separate terminal:
 python -m server.main --host 127.0.0.1 --port 8765 --difficulty medium
 ```
 
+Run a PvP-only server without zombies:
+
+```bash
+python -m server.main --host 127.0.0.1 --port 8765 --mode pvp
+```
+
 For profiling network queues and snapshot timings:
 
 ```powershell
@@ -78,9 +85,27 @@ Servers are configured in [servers.json](servers.json). Add more entries like th
 ]
 ```
 
-Server difficulty can be `easy`, `medium`, `hard` or `insane`. In online mode the server owns the world balance.
+Server difficulty can be `easy`, `medium`, `hard` or `insane`. In online mode the server owns the world balance. The default server profile is tuned for very smooth 1-10 player sessions and a hard cap of 50 players; PvP servers advertise themselves in the server list and run without zombie AI.
 
 Server networking is configured in `configs/server.json`. The current online protocol uses optimized TCP frames with compact snapshot schema `compact-v1`. UDP is exposed as a reserved launch option for future protocol work, but the playable server currently runs on TCP.
+
+For online tests, the server defaults are tuned for stability: 30 TPS, 24 snapshot cycles per second for small 1-15 player matches, 20 Hz around 16-32 players, 15 Hz around 33-44 players, and 12 Hz near the 50-player cap. The server uses time-sliced batched snapshot delivery, slow-client snapshot throttling and at most one pending realtime snapshot per client. The Pygame online client predicts local movement every rendered frame and throttles unchanged network input to reduce spam.
+
+The server also exposes HTTP observability endpoints from `configs/server.json -> observability`:
+
+- `http://127.0.0.1:8766/health`
+- `http://127.0.0.1:8766/ready`
+- `http://127.0.0.1:8766/metrics`
+
+## Load Testing
+
+Run headless fake clients against the server:
+
+```powershell
+python -m load_tests.fake_client_runner --profile smoke --host 127.0.0.1 --port 8765
+```
+
+Profile `50` is the primary regression target for this server profile. Larger load-test profiles still exist for experiments, but the playable server is balanced around bots plus up to 50 players. Full instructions and metric explanations are in [load_tests/README.md](load_tests/README.md).
 
 ## Controls
 
