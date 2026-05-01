@@ -264,6 +264,12 @@ Difficulty is applied by the authoritative server in online mode.
 
 - `simulation.tick_rate`: authoritative simulation ticks per second. Higher values improve responsiveness but increase CPU cost.
 - `simulation.snapshot_rate`: maximum snapshot send rate per client before adaptive throttling. The default keeps small 1-15 player sessions at 24 Hz while the client predicts local movement every rendered frame.
+- `simulation.zombie_ai_decision_rate`: near-player zombie perception/decision rate in Hz. Movement and collisions still run every server tick; this only controls expensive sight/hearing decisions.
+- `simulation.zombie_ai_far_decision_rate`: slower perception rate for zombies outside the active player radius.
+- `simulation.zombie_ai_active_radius`: player distance that promotes a zombie to the near decision rate.
+- `simulation.zombie_ai_far_radius`: maximum distance used when selecting players for zombie AI decisions before expensive line-of-sight checks.
+- `simulation.zombie_ai_batch_size`: maximum zombie decision tasks scheduled per simulation tick. This staggers AI work instead of making every zombie think on the same frame.
+- `simulation.zombie_ai_process_workers`: process workers used for zombie AI decisions. Use `0` to keep decisions in the simulation thread, or override at launch with `--zombie-workers`.
 - `network.max_clients`: hard cap for simultaneously connected players. Resume tickets do not count as connected players, but they still keep players in the world until timeout.
 - `network.listen_backlog`: TCP accept backlog for connection bursts during load tests or server-list joins.
 - `network.interest_radius`: radius around each player for high-frequency entities such as zombies, loot, projectiles, grenades, mines and poison pools.

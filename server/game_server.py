@@ -42,7 +42,12 @@ class SimulationRunner:
         tick_rate: int = TICK_RATE,
         snapshot_rate: int = SNAPSHOT_RATE,
         command_queue_limit: int = 128,
-        zombie_workers: int | None = None,
+        zombie_workers: int | None = 0,
+        zombie_ai_decision_rate: float = 6.0,
+        zombie_ai_far_decision_rate: float = 2.0,
+        zombie_ai_active_radius: float = 1800.0,
+        zombie_ai_far_radius: float = 3200.0,
+        zombie_ai_batch_size: int = 8,
         pvp: bool = False,
         tick_observer: Callable[[float], None] | None = None,
         stage_observer: Callable[[str, float], None] | None = None,
@@ -53,6 +58,11 @@ class SimulationRunner:
             initial_zombies=0 if pvp else None,
             max_zombies=0 if pvp else None,
             zombie_workers=0 if pvp else zombie_workers,
+            zombie_ai_decision_rate=zombie_ai_decision_rate,
+            zombie_ai_far_decision_rate=zombie_ai_far_decision_rate,
+            zombie_ai_active_radius=zombie_ai_active_radius,
+            zombie_ai_far_radius=zombie_ai_far_radius,
+            zombie_ai_batch_size=zombie_ai_batch_size,
         )
         self.tick_rate = max(1, int(tick_rate))
         self.snapshot_rate = max(1, int(snapshot_rate))
@@ -518,7 +528,14 @@ class GameServer:
             tick_rate=self.tick_rate,
             snapshot_rate=self.snapshot_rate,
             command_queue_limit=self.tuning.network.command_queue_limit,
-            zombie_workers=zombie_workers,
+            zombie_workers=zombie_workers
+            if zombie_workers is not None
+            else self.tuning.simulation.zombie_ai_process_workers,
+            zombie_ai_decision_rate=self.tuning.simulation.zombie_ai_decision_rate,
+            zombie_ai_far_decision_rate=self.tuning.simulation.zombie_ai_far_decision_rate,
+            zombie_ai_active_radius=self.tuning.simulation.zombie_ai_active_radius,
+            zombie_ai_far_radius=self.tuning.simulation.zombie_ai_far_radius,
+            zombie_ai_batch_size=self.tuning.simulation.zombie_ai_batch_size,
             pvp=pvp,
             tick_observer=self.metrics.observe_tick,
             stage_observer=self.metrics.observe_stage,

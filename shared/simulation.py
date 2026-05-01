@@ -5,7 +5,7 @@ import os
 import random
 import threading
 from collections import deque
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ProcessPoolExecutor
 from dataclasses import dataclass, replace
 from typing import Any, Deque
 
@@ -93,6 +93,197 @@ _COMMAND_EVENT_NAMES = {
 }
 
 
+def _zombie_ai_decision_batch_worker(tasks: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [_zombie_ai_decision_worker(task) for task in tasks]
+
+
+def _zombie_ai_decision_worker(task: dict[str, Any]) -> dict[str, Any]:
+    zombie = task["zombie"]
+    players = task["players"]
+    walls = task["walls"]
+    spec = ZOMBIES.get(zombie["kind"])
+    decision: dict[str, Any] = {
+        "id": zombie["id"],
+        "generation": zombie.get("generation", 0),
+        "mode": zombie["mode"],
+        "target_player_id": zombie.get("target_player_id"),
+        "last_known_pos": zombie.get("last_known_pos"),
+        "search_timer": zombie.get("search_timer", 0.0),
+        "alertness": zombie.get("alertness", 0.0),
+    }
+    if not spec or not players:
+        return decision
+
+    visible = _zombie_ai_visible_player(zombie, players, walls, spec)
+    if visible:
+        decision.update(
+            {
+                "mode": "chase",
+                "target_player_id": visible["id"],
+                "last_known_pos": {"x": visible["x"], "y": visible["y"]},
+                "search_timer": SEARCH_DURATION,
+                "alertness": 1.0,
+            }
+        )
+        return decision
+
+    if zombie["mode"] == "chase":
+        return decision
+
+    heard = _zombie_ai_heard_player(zombie, players, walls, spec)
+    if heard:
+        decision.update(
+            {
+                "mode": "investigate",
+                "target_player_id": heard["id"],
+                "last_known_pos": {"x": heard["x"], "y": heard["y"]},
+                "search_timer": max(float(zombie.get("search_timer", 0.0)), 2.2),
+                "alertness": min(1.0, float(zombie.get("alertness", 0.0)) + 0.22 * spec.sensitivity),
+            }
+        )
+    return decision
+
+
+def _zombie_ai_visible_player(
+    zombie: dict[str, Any],
+    players: list[dict[str, Any]],
+    walls: tuple[tuple[float, float, float, float], ...],
+    spec: Any,
+) -> dict[str, Any] | None:
+    best: dict[str, Any] | None = None
+    best_dist2 = float("inf")
+    sight2 = spec.sight_range * spec.sight_range
+    half_fov = math.radians(spec.fov_degrees * 0.5)
+    zx = float(zombie["x"])
+    zy = float(zombie["y"])
+    zfloor = int(zombie["floor"])
+    facing = float(zombie["facing"])
+    for player in players:
+        if int(player["floor"]) != zfloor:
+            continue
+        dx = float(player["x"]) - zx
+        dy = float(player["y"]) - zy
+        dist2 = dx * dx + dy * dy
+        if dist2 > sight2 or dist2 >= best_dist2:
+            continue
+        angle = math.atan2(dy, dx)
+        if abs(_worker_angle_delta(facing, angle)) > half_fov:
+            continue
+        if _worker_line_blocked(zx, zy, float(player["x"]), float(player["y"]), walls, sound=False):
+            continue
+        best = player
+        best_dist2 = dist2
+    return best
+
+
+def _zombie_ai_heard_player(
+    zombie: dict[str, Any],
+    players: list[dict[str, Any]],
+    walls: tuple[tuple[float, float, float, float], ...],
+    spec: Any,
+) -> dict[str, Any] | None:
+    best: dict[str, Any] | None = None
+    best_dist2 = float("inf")
+    zx = float(zombie["x"])
+    zy = float(zombie["y"])
+    zfloor = int(zombie["floor"])
+    for player in players:
+        if int(player["floor"]) != zfloor or player.get("inside_building"):
+            continue
+        noise = float(player.get("noise", 0.0))
+        if noise <= 0.0:
+            continue
+        dx = float(player["x"]) - zx
+        dy = float(player["y"]) - zy
+        dist2 = dx * dx + dy * dy
+        hearing = spec.hearing_range + noise * spec.sensitivity
+        if dist2 > hearing * hearing or dist2 >= best_dist2:
+            continue
+        if _worker_line_blocked(zx, zy, float(player["x"]), float(player["y"]), walls, sound=True):
+            continue
+        best = player
+        best_dist2 = dist2
+    return best
+
+
+def _worker_line_blocked(
+    ax: float,
+    ay: float,
+    bx: float,
+    by: float,
+    walls: tuple[tuple[float, float, float, float], ...],
+    *,
+    sound: bool,
+) -> bool:
+    for wall in walls:
+        if _worker_segment_rect_intersects(ax, ay, bx, by, wall):
+            if sound and wall[2] < 28 and wall[3] < 90:
+                continue
+            return True
+    return False
+
+
+def _worker_segment_rect_intersects(
+    ax: float,
+    ay: float,
+    bx: float,
+    by: float,
+    rect: tuple[float, float, float, float],
+) -> bool:
+    rx, ry, rw, rh = rect
+    rright = rx + rw
+    rbottom = ry + rh
+    if rx <= ax <= rright and ry <= ay <= rbottom:
+        return True
+    if rx <= bx <= rright and ry <= by <= rbottom:
+        return True
+    return (
+        _worker_segments_intersect(ax, ay, bx, by, rx, ry, rright, ry)
+        or _worker_segments_intersect(ax, ay, bx, by, rright, ry, rright, rbottom)
+        or _worker_segments_intersect(ax, ay, bx, by, rright, rbottom, rx, rbottom)
+        or _worker_segments_intersect(ax, ay, bx, by, rx, rbottom, rx, ry)
+    )
+
+
+def _worker_segments_intersect(
+    ax: float,
+    ay: float,
+    bx: float,
+    by: float,
+    cx: float,
+    cy: float,
+    dx: float,
+    dy: float,
+) -> bool:
+    def orient(px: float, py: float, qx: float, qy: float, rx: float, ry: float) -> float:
+        return (qy - py) * (rx - qx) - (qx - px) * (ry - qy)
+
+    def on_segment(px: float, py: float, qx: float, qy: float, rx: float, ry: float) -> bool:
+        return min(px, rx) <= qx <= max(px, rx) and min(py, ry) <= qy <= max(py, ry)
+
+    o1 = orient(ax, ay, bx, by, cx, cy)
+    o2 = orient(ax, ay, bx, by, dx, dy)
+    o3 = orient(cx, cy, dx, dy, ax, ay)
+    o4 = orient(cx, cy, dx, dy, bx, by)
+    if (o1 > 0) != (o2 > 0) and (o3 > 0) != (o4 > 0):
+        return True
+    epsilon = 1e-7
+    return (
+        abs(o1) <= epsilon
+        and on_segment(ax, ay, cx, cy, bx, by)
+        or abs(o2) <= epsilon
+        and on_segment(ax, ay, dx, dy, bx, by)
+        or abs(o3) <= epsilon
+        and on_segment(cx, cy, ax, ay, dx, dy)
+        or abs(o4) <= epsilon
+        and on_segment(cx, cy, bx, by, dx, dy)
+    )
+
+
+def _worker_angle_delta(a: float, b: float) -> float:
+    return (b - a + math.pi) % math.tau - math.pi
+
+
 class GameWorld:
     def __init__(
         self,
@@ -100,7 +291,12 @@ class GameWorld:
         initial_zombies: int | None = None,
         max_zombies: int | None = None,
         difficulty_key: str = "medium",
-        zombie_workers: int | None = None,
+        zombie_workers: int | None = 0,
+        zombie_ai_decision_rate: float = 6.0,
+        zombie_ai_far_decision_rate: float = 2.0,
+        zombie_ai_active_radius: float = 1800.0,
+        zombie_ai_far_radius: float = 3200.0,
+        zombie_ai_batch_size: int = 8,
     ) -> None:
         self._lock = threading.RLock()
         self._geometry_cache_lock = threading.Lock()
@@ -127,20 +323,33 @@ class GameWorld:
         self._loot_timer = 0.0
         self._geometry_version = 0
         self._closed_walls_cache: dict[int, tuple[int, tuple[RectState, ...]]] = {}
+        self._zombie_ai_wall_cache: dict[int, tuple[int, tuple[tuple[float, float, float, float], ...]]] = {}
         self._zombie_rngs: dict[str, random.Random] = {}
+        self._zombie_ai_next_at: dict[str, float] = {}
+        self._zombie_ai_pending: dict[str, Future] = {}
+        self._zombie_ai_futures: set[Future] = set()
+        self._zombie_ai_generation: dict[str, int] = {}
+        self._zombie_ai_decision_interval = 1.0 / max(0.25, float(zombie_ai_decision_rate))
+        self._zombie_ai_far_decision_interval = 1.0 / max(0.1, float(zombie_ai_far_decision_rate))
+        self._zombie_ai_active_radius = max(240.0, float(zombie_ai_active_radius))
+        self._zombie_ai_far_radius = max(self._zombie_ai_active_radius, float(zombie_ai_far_radius))
+        self._zombie_ai_batch_size = max(1, int(zombie_ai_batch_size))
         cpu_budget = max(1, (os.cpu_count() or 4) - 1)
-        worker_count = 0 if self.max_zombies <= 0 else zombie_workers if zombie_workers is not None else min(12, cpu_budget, self.max_zombies)
-        self._zombie_executor: ThreadPoolExecutor | None = None
+        worker_count = 0 if self.max_zombies <= 0 else zombie_workers if zombie_workers is not None else min(2, cpu_budget, self.max_zombies)
+        self._zombie_executor: ProcessPoolExecutor | None = None
+        self._zombie_ai_max_pending_batches = max(1, (max(1, worker_count) if worker_count > 0 else 1) * 2)
         if worker_count > 0:
-            self._zombie_executor = ThreadPoolExecutor(
+            self._zombie_executor = ProcessPoolExecutor(
                 max_workers=max(1, worker_count),
-                thread_name_prefix="zombie-ai",
             )
         self._prime_map()
 
     def close(self) -> None:
         if self._zombie_executor:
             self._zombie_executor.shutdown(wait=False, cancel_futures=True)
+            self._zombie_executor = None
+        self._zombie_ai_pending.clear()
+        self._zombie_ai_futures.clear()
 
     def _id(self, prefix: str) -> str:
         value = f"{prefix}{self._next_id}"
@@ -619,40 +828,166 @@ class GameWorld:
         living_players = tuple(player for player in self.players.values() if player.alive)
         zombies = list(self.zombies.values())
         if not zombies:
+            self._drain_zombie_ai_decisions()
             return
         active_ids = {zombie.id for zombie in zombies}
         for zombie_id in list(self._zombie_rngs):
             if zombie_id not in active_ids:
                 self._zombie_rngs.pop(zombie_id, None)
+        for zombie_id in list(self._zombie_ai_next_at):
+            if zombie_id not in active_ids:
+                self._zombie_ai_next_at.pop(zombie_id, None)
+        for zombie_id in list(self._zombie_ai_pending):
+            if zombie_id not in active_ids:
+                self._zombie_ai_pending.pop(zombie_id, None)
+        for zombie_id in list(self._zombie_ai_generation):
+            if zombie_id not in active_ids:
+                self._zombie_ai_generation.pop(zombie_id, None)
 
-        if len(zombies) < 2:
-            for zombie in zombies:
-                result = self._update_zombie_actor(zombie, dt, living_players, self._zombie_rng(zombie.id), clone=False)
-                self._apply_zombie_result(result)
+        self._drain_zombie_ai_decisions()
+        self._schedule_zombie_ai_decisions(zombies, living_players)
+
+        for zombie in zombies:
+            if zombie.id not in self.zombies:
+                continue
+            result = self._advance_zombie_actor(zombie, dt, living_players, self._zombie_rng(zombie.id))
+            self._apply_zombie_result(result)
+
+    def _drain_zombie_ai_decisions(self) -> None:
+        for future in list(self._zombie_ai_futures):
+            if not future.done():
+                continue
+            self._zombie_ai_futures.discard(future)
+            for zombie_id, pending in list(self._zombie_ai_pending.items()):
+                if pending is future:
+                    self._zombie_ai_pending.pop(zombie_id, None)
+            try:
+                decisions = future.result()
+            except Exception:
+                continue
+            for decision in decisions:
+                self._apply_zombie_ai_decision(decision)
+
+    def _schedule_zombie_ai_decisions(self, zombies: list[ZombieState], living_players: tuple[PlayerState, ...]) -> None:
+        if not living_players:
             return
-
+        if self._zombie_executor and len(self._zombie_ai_futures) >= self._zombie_ai_max_pending_batches:
+            return
+        tasks: list[dict[str, Any]] = []
+        for zombie in zombies:
+            if len(tasks) >= self._zombie_ai_batch_size:
+                break
+            if zombie.id in self._zombie_ai_pending:
+                continue
+            if self.time < self._zombie_ai_next_at.get(zombie.id, 0.0):
+                continue
+            candidates, interval = self._zombie_ai_candidates(zombie, living_players)
+            self._zombie_ai_next_at[zombie.id] = self.time + interval * self.rng.uniform(0.75, 1.35)
+            if not candidates:
+                continue
+            tasks.append(self._zombie_ai_task(zombie, candidates))
+        if not tasks:
+            return
         if not self._zombie_executor:
-            for zombie in zombies:
-                result = self._update_zombie_actor(zombie, dt, living_players, self._zombie_rng(zombie.id), clone=False)
-                self._apply_zombie_result(result)
+            for decision in _zombie_ai_decision_batch_worker(tasks):
+                self._apply_zombie_ai_decision(decision)
             return
+        try:
+            future = self._zombie_executor.submit(_zombie_ai_decision_batch_worker, tasks)
+        except Exception:
+            for decision in _zombie_ai_decision_batch_worker(tasks):
+                self._apply_zombie_ai_decision(decision)
+            return
+        self._zombie_ai_futures.add(future)
+        for task in tasks:
+            self._zombie_ai_pending[str(task["zombie"]["id"])] = future
 
-        futures = [
-            self._zombie_executor.submit(
-                self._update_zombie_actor,
-                self._clone_zombie(zombie),
-                dt,
-                living_players,
-                self._zombie_rng(zombie.id),
-                False,
-            )
-            for zombie in zombies
-        ]
-        for future in futures:
-            result = future.result()
-            if result.zombie.id in self.zombies:
-                self.zombies[result.zombie.id] = result.zombie
-                self._apply_zombie_result(result)
+    def _zombie_ai_candidates(
+        self,
+        zombie: ZombieState,
+        living_players: tuple[PlayerState, ...],
+    ) -> tuple[tuple[PlayerState, ...], float]:
+        spec = ZOMBIES[zombie.kind]
+        active_radius2 = self._zombie_ai_active_radius * self._zombie_ai_active_radius
+        far_radius = max(self._zombie_ai_far_radius, spec.sight_range + 160.0, spec.hearing_range + SPRINT_NOISE * spec.sensitivity)
+        far_radius2 = far_radius * far_radius
+        target_player_id = zombie.target_player_id
+        active = zombie.mode != "patrol"
+        candidates: list[tuple[float, PlayerState]] = []
+        for player in living_players:
+            if player.floor != zombie.floor:
+                continue
+            dx = player.pos.x - zombie.pos.x
+            dy = player.pos.y - zombie.pos.y
+            dist2 = dx * dx + dy * dy
+            noisy_radius = spec.hearing_range + max(0.0, player.noise) * spec.sensitivity + 128.0
+            noisy_radius2 = noisy_radius * noisy_radius
+            is_target = target_player_id == player.id
+            if dist2 <= far_radius2 or (player.noise > 0.0 and dist2 <= noisy_radius2) or is_target:
+                candidates.append((dist2, player))
+                if dist2 <= active_radius2 or player.noise > 0.0 or is_target:
+                    active = True
+        if not candidates:
+            return (), self._zombie_ai_far_decision_interval
+        candidates.sort(key=lambda item: item[0])
+        interval = self._zombie_ai_decision_interval if active else self._zombie_ai_far_decision_interval
+        return tuple(player for _, player in candidates[:8]), interval
+
+    def _zombie_ai_task(self, zombie: ZombieState, players: tuple[PlayerState, ...]) -> dict[str, Any]:
+        return {
+            "zombie": {
+                "id": zombie.id,
+                "generation": self._zombie_ai_generation.get(zombie.id, 0),
+                "kind": zombie.kind,
+                "x": zombie.pos.x,
+                "y": zombie.pos.y,
+                "floor": zombie.floor,
+                "facing": zombie.facing,
+                "mode": zombie.mode,
+                "target_player_id": zombie.target_player_id,
+                "last_known_pos": zombie.last_known_pos.to_dict() if zombie.last_known_pos else None,
+                "search_timer": zombie.search_timer,
+                "alertness": zombie.alertness,
+            },
+            "players": [
+                {
+                    "id": player.id,
+                    "x": player.pos.x,
+                    "y": player.pos.y,
+                    "floor": player.floor,
+                    "noise": player.noise,
+                    "inside_building": player.inside_building,
+                }
+                for player in players
+            ],
+            "walls": self._zombie_ai_wall_payload(zombie.floor),
+        }
+
+    def _zombie_ai_wall_payload(self, floor: int) -> tuple[tuple[float, float, float, float], ...]:
+        cached = self._zombie_ai_wall_cache.get(floor)
+        if cached and cached[0] == self._geometry_version:
+            return cached[1]
+        walls = tuple((wall.x, wall.y, wall.w, wall.h) for wall in self._closed_walls(floor))
+        self._zombie_ai_wall_cache[floor] = (self._geometry_version, walls)
+        return walls
+
+    def _apply_zombie_ai_decision(self, decision: dict[str, Any]) -> None:
+        zombie = self.zombies.get(str(decision.get("id", "")))
+        if not zombie:
+            return
+        generation = int(decision.get("generation", -1))
+        if generation != self._zombie_ai_generation.get(zombie.id, 0):
+            return
+        mode = str(decision.get("mode", zombie.mode))
+        if mode not in {"chase", "investigate"}:
+            return
+        zombie.mode = mode
+        zombie.target_player_id = decision.get("target_player_id")
+        last_known = decision.get("last_known_pos")
+        if isinstance(last_known, dict):
+            zombie.last_known_pos = Vec2(float(last_known.get("x", zombie.pos.x)), float(last_known.get("y", zombie.pos.y)))
+        zombie.search_timer = max(zombie.search_timer, float(decision.get("search_timer", zombie.search_timer)))
+        zombie.alertness = max(zombie.alertness, float(decision.get("alertness", zombie.alertness)))
 
     def _zombie_rng(self, zombie_id: str) -> random.Random:
         rng = self._zombie_rngs.get(zombie_id)
@@ -711,6 +1046,76 @@ class GameWorld:
 
         actor.inside_building = point_building(self.buildings, actor.pos)
         return _ZombieUpdateResult(actor, player_hits, poison_spits)
+
+    def _advance_zombie_actor(
+        self,
+        zombie: ZombieState,
+        dt: float,
+        living_players: tuple[PlayerState, ...],
+        rng: random.Random,
+    ) -> _ZombieUpdateResult:
+        player_hits: list[tuple[str, int]] = []
+        poison_spits: list[_PoisonSpitEvent] = []
+        zombie.attack_cooldown = max(0.0, zombie.attack_cooldown - dt)
+        zombie.special_cooldown = max(0.0, zombie.special_cooldown - dt)
+        zombie.sidestep_timer = max(0.0, zombie.sidestep_timer - dt)
+
+        if not living_players and zombie.mode != "patrol":
+            zombie.mode = "patrol"
+            zombie.target_player_id = None
+            zombie.last_known_pos = None
+            zombie.waypoint = None
+            zombie.alertness = 0.0
+
+        if zombie.mode == "chase":
+            self._update_chase_movement(zombie, dt, living_players, rng, player_hits, poison_spits)
+        elif zombie.mode == "investigate":
+            self._update_investigate(zombie, dt, living_players, rng)
+        elif zombie.mode == "search":
+            self._update_search(zombie, dt, rng)
+        else:
+            self._update_patrol(zombie, dt, rng)
+
+        zombie.inside_building = point_building(self.buildings, zombie.pos)
+        return _ZombieUpdateResult(zombie, player_hits, poison_spits)
+
+    def _update_chase_movement(
+        self,
+        zombie: ZombieState,
+        dt: float,
+        players: tuple[PlayerState, ...],
+        rng: random.Random,
+        player_hits: list[tuple[str, int]],
+        poison_spits: list[_PoisonSpitEvent],
+    ) -> None:
+        target = self._find_player(players, zombie.target_player_id)
+        destination = zombie.last_known_pos
+        if target and target.alive and target.floor == zombie.floor:
+            if target.inside_building:
+                entry = self._building_entry_target(target.inside_building)
+                if entry:
+                    destination = entry
+            elif destination is None:
+                destination = target.pos.copy()
+            if zombie.kind == "leaper":
+                self._try_poison_spit(zombie, target, rng, poison_spits)
+            if zombie.pos.distance_to(target.pos) <= ZOMBIE_TARGET_RADIUS + ZOMBIES[zombie.kind].radius:
+                if not self._line_blocked(zombie.pos, target.pos, zombie.floor):
+                    self._try_zombie_attack(zombie, target, player_hits)
+
+        if destination:
+            if zombie.pos.distance_to(destination) > 28:
+                if zombie.kind == "leaper" and target and target.alive and target.floor == zombie.floor and not target.inside_building:
+                    self._leaper_move_toward(zombie, destination, dt, rng)
+                else:
+                    self._zombie_move_toward(zombie, destination, dt, sprint=True, rng=rng)
+            else:
+                zombie.mode = "search"
+                zombie.search_timer = SEARCH_DURATION
+            return
+
+        zombie.mode = "patrol"
+        zombie.target_player_id = None
 
     def _apply_zombie_result(self, result: _ZombieUpdateResult) -> None:
         for player_id, damage in result.player_hits:
@@ -965,15 +1370,19 @@ class GameWorld:
             return None
         return min(heard, key=lambda player: zombie.pos.distance_to(player.pos))
 
-    def _damage_zombie(self, zombie: ZombieState, damage: int, owner_id: str) -> None:
+    def _damage_zombie(
+        self,
+        zombie: ZombieState,
+        damage: int,
+        owner_id: str,
+        source_pos: Vec2 | None = None,
+        reveal_owner: bool = True,
+    ) -> None:
         if zombie.armor > 0:
             blocked = min(zombie.armor, math.ceil(damage * 0.55))
             zombie.armor -= blocked
             damage -= blocked // 2
         zombie.health -= max(1, damage)
-        zombie.mode = "search"
-        zombie.last_known_pos = self.players[owner_id].pos.copy() if owner_id in self.players else zombie.last_known_pos
-        zombie.search_timer = SEARCH_DURATION
         if zombie.health <= 0:
             self.zombies.pop(zombie.id, None)
             player = self.players.get(owner_id)
@@ -982,6 +1391,44 @@ class GameWorld:
                 player.kills_by_kind[zombie.kind] = player.kills_by_kind.get(zombie.kind, 0) + 1
             if self.rng.random() < 0.45:
                 self._drop_from_zombie(zombie.pos)
+            self._zombie_ai_generation.pop(zombie.id, None)
+            self._zombie_ai_pending.pop(zombie.id, None)
+            self._zombie_ai_next_at.pop(zombie.id, None)
+            return
+        self._alert_zombie_from_damage(zombie, owner_id, source_pos, reveal_owner)
+
+    def _alert_zombie_from_damage(
+        self,
+        zombie: ZombieState,
+        owner_id: str,
+        source_pos: Vec2 | None = None,
+        reveal_owner: bool = True,
+    ) -> None:
+        owner = self.players.get(owner_id) if reveal_owner else None
+        if owner and owner.alive:
+            alert_pos = source_pos.copy() if source_pos else owner.pos.copy()
+            if owner.floor == zombie.floor:
+                zombie.mode = "chase"
+                zombie.target_player_id = owner.id
+            else:
+                zombie.mode = "search"
+                zombie.target_player_id = None
+        elif source_pos:
+            alert_pos = source_pos.copy()
+            zombie.mode = "investigate"
+            zombie.target_player_id = None
+        else:
+            return
+        alert_pos.clamp_to_map(MAP_WIDTH, MAP_HEIGHT)
+        zombie.last_known_pos = alert_pos
+        zombie.waypoint = None
+        zombie.idle_timer = 0.0
+        zombie.search_timer = SEARCH_DURATION
+        zombie.alertness = 1.0
+        zombie.facing = zombie.pos.angle_to(alert_pos)
+        self._zombie_ai_generation[zombie.id] = self._zombie_ai_generation.get(zombie.id, 0) + 1
+        self._zombie_ai_pending.pop(zombie.id, None)
+        self._zombie_ai_next_at[zombie.id] = self.time
 
     def _damage_player(self, player: PlayerState, damage: int) -> None:
         player.healing_left = 0.0
@@ -1641,7 +2088,7 @@ class GameWorld:
             distance = zombie.pos.distance_to(pos)
             if distance <= blast_radius and not self._line_blocked(pos, zombie.pos, floor):
                 damage = int(zombie_damage * (1.0 - distance / blast_radius)) + zombie_damage_bonus
-                self._damage_zombie(zombie, damage, owner_id)
+                self._damage_zombie(zombie, damage, owner_id, source_pos=pos, reveal_owner=False)
         for player in self.players.values():
             if player.floor != floor or not player.alive:
                 continue
@@ -1739,6 +2186,8 @@ class GameWorld:
         zombie = ZombieState(self._id("z"), kind, pos, health, armor, facing=self.rng.uniform(-math.pi, math.pi))
         zombie.waypoint = self._random_patrol_pos(self.rng)
         self.zombies[zombie.id] = zombie
+        self._zombie_ai_generation[zombie.id] = 0
+        self._zombie_ai_next_at[zombie.id] = self.time + self.rng.uniform(0.0, self._zombie_ai_far_decision_interval)
         return zombie
 
     def _loot_count(self, base: int, minimum: int = 1) -> int:
@@ -1922,6 +2371,7 @@ class GameWorld:
         with self._geometry_cache_lock:
             self._geometry_version += 1
             self._closed_walls_cache.clear()
+            self._zombie_ai_wall_cache.clear()
 
     def _closed_walls(self, floor: int) -> tuple[RectState, ...]:
         cached = self._closed_walls_cache.get(floor)
